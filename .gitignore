@@ -11,3 +11,7 @@ build/
 *.egg-info/
 # Robinhood session cache
 *.pickle
+# Runtime log output
+execution_log.txt
+# Claude Code internal state
+.claude/
