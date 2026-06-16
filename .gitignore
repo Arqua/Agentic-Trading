@@ -1,0 +1,13 @@
+.env
+*.log
+__pycache__/
+*.pyc
+*.pyo
+.python-version
+venv/
+.venv/
+dist/
+build/
+*.egg-info/
+# Robinhood session cache
+*.pickle
