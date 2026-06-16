@@ -92,6 +92,7 @@ class ORBStrategy:
         symbol: str,
         price: float,
         inverse_map: dict,
+        sentiment_boost: float = 1.0,
         tick_size: float = 0.01,
     ) -> "Signal | None":
         """
@@ -99,10 +100,13 @@ class ORBStrategy:
 
         Parameters
         ----------
-        symbol     : The underlying ticker being evaluated.
-        price      : Current market price.
-        inverse_map: INVERSE_ETF_MAP dict {underlying -> inverse_etf}.
-        tick_size  : Minimum clearance above/below boundary to confirm break.
+        symbol          : The underlying ticker being evaluated.
+        price           : Current market price.
+        inverse_map     : INVERSE_ETF_MAP dict {underlying -> inverse_etf}.
+        sentiment_boost : Multiplier from SentimentEngine.get_boost(). Values
+                          above 1.2 lower the breakout threshold by 50% so
+                          heavily bullish tickers can trigger slightly early.
+        tick_size       : Minimum clearance above/below boundary to confirm break.
 
         Returns
         -------
@@ -116,8 +120,11 @@ class ORBStrategy:
         orb_high = self._high[symbol]
         orb_low  = self._low[symbol]
 
+        # High sentiment lowers the required breakout clearance
+        adj_tick = tick_size * 0.5 if sentiment_boost > 1.2 else tick_size
+
         # ── Long breakout ────────────────────────────────────────────
-        if not self._triggered_long.get(symbol) and price > orb_high + tick_size:
+        if not self._triggered_long.get(symbol) and price > orb_high + adj_tick:
             self._triggered_long[symbol] = True
             entry = round(price, 4)
             tp    = round(entry * (1 + self.TP_PCT), 4)

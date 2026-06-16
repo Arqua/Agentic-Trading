@@ -19,6 +19,7 @@ import asyncio
 import logging
 import os
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timezone
 from typing import Dict, List, Optional
@@ -37,8 +38,22 @@ from logger import (
     log, log_phase, log_signal, log_order, log_fill,
     log_cash, log_pnl, log_halt, log_error,
 )
+import trade_db
+from sentiment import SentimentEngine
 
 load_dotenv()
+
+# ── GUI-controllable stop event ───────────────────────────────────────────────
+# Set this event to request a clean shutdown from outside (e.g. the GUI).
+BOT_STOP: threading.Event = threading.Event()
+
+# Shared state dict for the GUI to poll (written by bot thread, read by GUI).
+BOT_STATE: Dict = {
+    "running":   False,
+    "strategy":  "—",
+    "portfolio": 0.0,
+    "status":    "idle",
+}
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -67,10 +82,13 @@ rsi_cache: Dict[str, float] = {}
 start_of_day_value: float = 0.0
 
 # Strategy singletons
-orb_strat     = ORBStrategy()
+orb_strat      = ORBStrategy()
 reversal_strat = ReversalStrategy()
-gap_go_strat  = GapAndGoStrategy()
-vwap_rev      = VWAPReversionStrategy()
+gap_go_strat   = GapAndGoStrategy()
+vwap_rev       = VWAPReversionStrategy()
+
+# Sentiment engine
+sentiment_eng = SentimentEngine()
 
 # Execution & risk management
 risk_mgr  = RiskManager(account_number=ACCOUNT_NUMBER)
@@ -391,7 +409,8 @@ async def check_signals(quotes: Dict[str, dict]) -> None:
 
         # ── Strategy 1: ORB ──────────────────────────────────────────
         if symbol not in INVERSE_ETF_SYMBOLS:
-            sig = orb_strat.check_signal(symbol, price, INVERSE_ETF_MAP)
+            boost = sentiment_eng.get_boost(symbol)
+            sig = orb_strat.check_signal(symbol, price, INVERSE_ETF_MAP, sentiment_boost=boost)
             if sig is not None:
                 # If INVERSE direction, reprice entry using current inverse quote
                 if sig.direction == "INVERSE":
@@ -417,7 +436,11 @@ async def check_signals(quotes: Dict[str, dict]) -> None:
                         except (TypeError, ValueError):
                             pass
                 log_signal(sig)
-                await exec_eng.execute_signal(sig)
+                order_id = await exec_eng.execute_signal(sig)
+                if order_id:
+                    alloc = round(price * (sig.entry_price / price if price else 1) * orb_strat.ALLOC_PCT, 2)
+                    trade_db.record_trade(sig.symbol, sig.strategy, "BUY",
+                                          0.0, sig.entry_price, order_id, alloc)
 
         # ── Strategy 2: Reversal ─────────────────────────────────────
         if symbol not in INVERSE_ETF_SYMBOLS:
@@ -447,21 +470,33 @@ async def check_signals(quotes: Dict[str, dict]) -> None:
                         except (TypeError, ValueError):
                             pass
                 log_signal(sig)
-                await exec_eng.execute_signal(sig)
+                order_id = await exec_eng.execute_signal(sig)
+                if order_id:
+                    alloc = round(sig.entry_price * reversal_strat.ALLOC_PCT, 2)
+                    trade_db.record_trade(sig.symbol, sig.strategy, "BUY",
+                                          0.0, sig.entry_price, order_id, alloc)
 
         # ── Strategy 3: Gap and Go ───────────────────────────────────
         if symbol not in INVERSE_ETF_SYMBOLS:
             sig = gap_go_strat.check_signal(symbol, price)
             if sig is not None:
                 log_signal(sig)
-                await exec_eng.execute_signal(sig)
+                order_id = await exec_eng.execute_signal(sig)
+                if order_id:
+                    alloc = round(sig.entry_price * gap_go_strat.ALLOC_PCT, 2)
+                    trade_db.record_trade(sig.symbol, sig.strategy, "BUY",
+                                          0.0, sig.entry_price, order_id, alloc)
 
         # ── Strategy 4: VWAP Reversion ───────────────────────────────
         if symbol not in INVERSE_ETF_SYMBOLS:
             sig = vwap_rev.check_signal(symbol, price)
             if sig is not None:
                 log_signal(sig)
-                await exec_eng.execute_signal(sig)
+                order_id = await exec_eng.execute_signal(sig)
+                if order_id:
+                    alloc = round(sig.entry_price * vwap_rev.ALLOC_PCT, 2)
+                    trade_db.record_trade(sig.symbol, sig.strategy, "BUY",
+                                          0.0, sig.entry_price, order_id, alloc)
 
 
 # ─── Portfolio value ──────────────────────────────────────────────────────────
@@ -543,6 +578,9 @@ async def main() -> None:
     log.info("Agentic Trading Bot  (4-strategy intraday)")
     log.info("=" * 70)
 
+    # ── Initialise trade database ────────────────────────────────────
+    trade_db.init_db()
+
     # ── Authentication ───────────────────────────────────────────────
     login()
 
@@ -551,12 +589,26 @@ async def main() -> None:
     log.info("Start-of-day portfolio value: $%.2f", start_of_day_value)
     log_cash(risk_mgr.get_buying_power(), label="open")
 
+    # ── Pre-fetch sentiment for all symbols ──────────────────────────
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(
+        _executor, lambda: sentiment_eng.refresh(WATCHLIST)
+    )
+
+    BOT_STATE["running"]   = True
+    BOT_STATE["status"]    = "waiting"
+    BOT_STATE["portfolio"] = start_of_day_value
+
     # ── Phase tracking ───────────────────────────────────────────────
-    orb_initialized   = False
+    orb_initialized      = False
     post_orb_initialized = False
-    trading_halted    = False
+    trading_halted       = False
+    last_sentiment_time  = 0.0
 
     while True:
+        if BOT_STOP.is_set():
+            log.info("BOT_STOP event set — shutting down cleanly.")
+            break
         try:
             now_et = _now_et()
 
@@ -606,12 +658,25 @@ async def main() -> None:
                     log_phase("POST_ORB", "scanning signals")
 
                 if not trading_halted:
+                    BOT_STATE["strategy"] = "scanning"
                     await check_signals(quotes)
 
                 await exec_eng.check_fills()
 
                 bp = risk_mgr.get_buying_power()
                 log_cash(bp, label="cycle")
+
+                # Refresh sentiment every 15 minutes
+                import time as _time
+                now_ts = _time.time()
+                if now_ts - last_sentiment_time > 900:
+                    await loop.run_in_executor(
+                        _executor, lambda: sentiment_eng.refresh(WATCHLIST)
+                    )
+                    last_sentiment_time = now_ts
+
+                # Update shared state for GUI
+                BOT_STATE["portfolio"] = await _get_portfolio_value()
 
                 await asyncio.sleep(POST_ORB_POLL_SECONDS)
 
@@ -626,6 +691,8 @@ async def main() -> None:
             log_error("main loop", exc)
             await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
+    BOT_STATE["running"] = False
+    BOT_STATE["status"]  = "stopped"
     log.info("Bot stopped.  Execution log: execution_log.txt")
 
 
