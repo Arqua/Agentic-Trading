@@ -111,3 +111,18 @@ def log_vwap(symbol: str, vwap: float, upper: float, lower: float):
 
 def log_rsi(symbol: str, rsi: float):
     log.debug(f"RSI      | symbol={symbol:<6} rsi={rsi:.2f}")
+
+
+def log_signal(strategy: str, symbol: str, direction: str, entry: float, tp: float, sl: float):
+    log.info(
+        f"SIGNAL   | strategy={strategy:<12} symbol={symbol:<6} dir={direction:<8} "
+        f"entry=${entry:.4f} tp=${tp:.4f} sl=${sl:.4f}"
+    )
+
+
+def log_cash(label: str, available: float, reserved: float = 0.0):
+    log.info(f"CASH     | {label:<20} available=${available:.2f} reserved=${reserved:.2f}")
+
+
+def log_error(context: str, exc: Exception):
+    log.error(f"ERROR    | context={context} exc={type(exc).__name__}: {exc}")

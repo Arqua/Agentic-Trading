@@ -1,601 +1,633 @@
-#!/usr/bin/env python3
 """
-Agentic Trading Bot — Robinhood
+trading_bot.py — Async main loop for the 4-strategy intraday trading bot.
 
-Strategy:
-  Momentum (first 15-min window only):
-    - Scan S&P 500 + Robinhood top-mover feeds each cycle
-    - Buy any stock with >= 1% gain vs. previous close
-    - Skip if bid-ask spread > 0.25% (fees/spread would erase profit)
-    - Immediately place a limit sell at entry + 0.5%
-    - Max 3 concurrent momentum positions; 10% of buying power each
+Strategies
+----------
+  Module 1: ORBStrategy          — Opening Range Breakout  (9:30–9:45)
+  Module 2: ReversalStrategy     — Fading the Open         (9:30–9:45)
+  Module 3: GapAndGoStrategy     — Gap and Go              (9:30–9:45 window, fire after)
+  Module 4: VWAPReversionStrategy — VWAP Mean Reversion    (post-9:45)
 
-  Large Mover (>= 3% gain, first 15-min window only):
-    - Allocate exactly 5% of start-of-day account value
-    - Place limit sell (take-profit) at entry + 10%
-    - Place stop-limit sell (stop-loss) at entry - 5%  (limit 1% below stop)
-
-  Risk management:
-    - Check portfolio value every 15 minutes
-    - If total daily loss >= 15% of start-of-day value, halt all new entries
-    - Stop-loss and take-profit orders remain live for existing positions
-
-Run:
-    cp .env.example .env   # fill in credentials
-    pip install -r requirements.txt
-    python trading_bot.py
-
-First run will prompt for MFA; subsequent runs use the cached session.
+Run
+---
+  cp .env.example .env    # add RH_USERNAME, RH_PASSWORD, RH_ACCOUNT_NUMBER
+  pip install -r requirements.txt
+  python trading_bot.py
 """
 
+import asyncio
+import logging
 import os
 import sys
-import time
-import logging
-import datetime
-from typing import Dict, List, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, datetime, timezone
+from typing import Dict, List, Optional
 
 import pytz
 from dotenv import load_dotenv
 
+import robin_stocks.robinhood as rs
+
+from watchlist import WATCHLIST, INVERSE_ETF_MAP, INVERSE_ETF_SYMBOLS
+from indicators import calculate_rsi, calculate_vwap_bands
+from strategies import ORBStrategy, ReversalStrategy, GapAndGoStrategy, VWAPReversionStrategy
+from execution import ExecutionEngine
+from risk_manager import RiskManager
+from logger import (
+    log, log_phase, log_signal, log_order, log_fill,
+    log_cash, log_pnl, log_halt, log_error,
+)
+
 load_dotenv()
 
-# ─── Logging ────────────────────────────────────────────────────────────────
+# ─── Constants ────────────────────────────────────────────────────────────────
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler("trading_bot.log"),
-    ],
-)
-log = logging.getLogger(__name__)
+ACCOUNT_NUMBER:          str   = os.environ["RH_ACCOUNT_NUMBER"]
+POLL_INTERVAL_SECONDS:   int   = 30    # polling cadence during ORB window
+POST_ORB_POLL_SECONDS:   int   = 60    # polling cadence post 9:45
+MAX_DAILY_LOSS_PCT:      float = 0.15  # halt if down >= 15%
 
-# ─── Configuration ───────────────────────────────────────────────────────────
+MARKET_TZ    = pytz.timezone("America/New_York")
+ORB_OPEN_H   = 9
+ORB_OPEN_M   = 30
+ORB_FREEZE_H = 9
+ORB_FREEZE_M = 45
+MARKET_CLOSE_H = 16
+MARKET_CLOSE_M = 0
 
-ACCOUNT_NUMBER: str = os.environ["RH_ACCOUNT_NUMBER"]
+# Thread pool shared with ExecutionEngine internals
+_executor = ThreadPoolExecutor(max_workers=10)
 
-MARKET_TZ = pytz.timezone("America/New_York")
-MARKET_OPEN = (9, 30)   # (hour, minute) ET
-MARKET_CLOSE = (16, 0)
+# ─── Module-level state ───────────────────────────────────────────────────────
 
-# How long to look for new entries after the open
-TRADING_WINDOW_MINUTES: int = 15
-# How often the main loop runs
-UPDATE_INTERVAL_SECONDS: int = 15 * 60
+# RSI values computed at 9:45 and refreshed each post-ORB scan
+rsi_cache: Dict[str, float] = {}
 
-# ── Momentum strategy ────────────────────────────────────────────────────────
-MOMENTUM_GAIN_THRESHOLD: float = 0.01     # Buy if stock up >= 1% vs prev close
-MOMENTUM_SELL_TARGET: float = 0.005       # Limit sell at entry + 0.5%
-MAX_SPREAD_PCT: float = 0.0025            # Skip entry if (ask-bid)/ask > 0.25%
-MOMENTUM_ALLOC_PCT: float = 0.10          # 10% of buying power per trade
-MAX_MOMENTUM_POSITIONS: int = 3
+# Start-of-day portfolio value for loss-limit comparison
+start_of_day_value: float = 0.0
 
-# ── Large-mover strategy ─────────────────────────────────────────────────────
-LARGE_MOVER_THRESHOLD: float = 0.03       # "Large" = up >= 3%
-LARGE_MOVER_ALLOC_PCT: float = 0.05       # 5% of start-of-day account value
-LARGE_MOVER_TAKE_PROFIT: float = 0.10     # Limit sell at entry + 10%
-LARGE_MOVER_STOP_PCT: float = 0.05        # Stop trigger at entry - 5%
-LARGE_MOVER_STOP_LIMIT_OFFSET: float = 0.01  # Limit = stop_price * (1 - 1%)
-MAX_LARGE_MOVER_POSITIONS: int = 1         # One large-mover bet per day
+# Strategy singletons
+orb_strat     = ORBStrategy()
+reversal_strat = ReversalStrategy()
+gap_go_strat  = GapAndGoStrategy()
+vwap_rev      = VWAPReversionStrategy()
 
-# ── Risk ─────────────────────────────────────────────────────────────────────
-DAILY_LOSS_LIMIT_PCT: float = 0.15        # Halt if down >= 15% of start value
-MIN_POSITION_USD: float = 1.00            # Smallest trade size to bother with
-
-# ─── Bot State ───────────────────────────────────────────────────────────────
-
-class BotState:
-    def __init__(self):
-        self.start_of_day_value: float = 0.0
-        self.trading_halted: bool = False
-        # symbol -> {qty, entry_price, buy_order_id, sell_order_id, target_price}
-        self.momentum_positions: Dict[str, dict] = {}
-        # symbol -> {qty, entry_price, buy_order_id, tp_order_id, sl_order_id, ...}
-        self.large_mover_positions: Dict[str, dict] = {}
-
-_state = BotState()
-
-# ─── Robinhood import (lazy so we can unit-test config without credentials) ──
-
-def _rh():
-    import robin_stocks.robinhood as rs
-    return rs
+# Execution & risk management
+risk_mgr  = RiskManager(account_number=ACCOUNT_NUMBER)
+exec_eng  = ExecutionEngine(account_number=ACCOUNT_NUMBER, risk_mgr=risk_mgr)
 
 
-# ─── Authentication ──────────────────────────────────────────────────────────
+# ─── Time helpers ─────────────────────────────────────────────────────────────
 
-def login():
-    rs = _rh()
-    username = os.environ["RH_USERNAME"]
-    password = os.environ["RH_PASSWORD"]
-    rs.login(
-        username,
-        password,
-        expiresIn=86400,
-        store_session=True,
-    )
-    log.info("Authenticated with Robinhood")
+def _now_et() -> datetime:
+    return datetime.now(MARKET_TZ)
 
 
-# ─── Market time helpers ──────────────────────────────────────────────────────
-
-def _now_et() -> datetime.datetime:
-    return datetime.datetime.now(MARKET_TZ)
-
-
-def is_market_open() -> bool:
+def _is_market_open() -> bool:
     n = _now_et()
     if n.weekday() >= 5:
         return False
-    open_dt = n.replace(hour=MARKET_OPEN[0], minute=MARKET_OPEN[1], second=0, microsecond=0)
-    close_dt = n.replace(hour=MARKET_CLOSE[0], minute=MARKET_CLOSE[1], second=0, microsecond=0)
+    open_dt  = n.replace(hour=ORB_OPEN_H,   minute=ORB_OPEN_M,   second=0, microsecond=0)
+    close_dt = n.replace(hour=MARKET_CLOSE_H, minute=MARKET_CLOSE_M, second=0, microsecond=0)
     return open_dt <= n < close_dt
 
 
-def is_in_trading_window() -> bool:
-    """True only during the first TRADING_WINDOW_MINUTES after market open."""
+def _in_orb_window() -> bool:
+    """True between 9:30 and 9:45 ET."""
     n = _now_et()
-    open_dt = n.replace(hour=MARKET_OPEN[0], minute=MARKET_OPEN[1], second=0, microsecond=0)
-    window_end = open_dt + datetime.timedelta(minutes=TRADING_WINDOW_MINUTES)
-    return open_dt <= n < window_end
+    open_dt   = n.replace(hour=ORB_OPEN_H,   minute=ORB_OPEN_M,   second=0, microsecond=0)
+    freeze_dt = n.replace(hour=ORB_FREEZE_H,  minute=ORB_FREEZE_M, second=0, microsecond=0)
+    return open_dt <= n < freeze_dt
 
 
-# ─── Portfolio / account helpers ─────────────────────────────────────────────
-
-def get_current_value_and_bp() -> Tuple[float, float]:
-    """Returns (total_portfolio_value, buying_power)."""
-    rs = _rh()
-    try:
-        port = rs.load_portfolio_profile(account_number=ACCOUNT_NUMBER)
-        value = float(port.get("market_value") or 0) + float(port.get("cash") or 0)
-    except Exception as e:
-        log.error(f"Failed to load portfolio profile: {e}")
-        value = _state.start_of_day_value  # best guess
-
-    try:
-        acct = rs.load_account_profile(account_number=ACCOUNT_NUMBER)
-        bp = float(acct.get("buying_power") or 0)
-    except Exception as e:
-        log.error(f"Failed to load account profile: {e}")
-        bp = 0.0
-
-    return value, bp
+def _past_orb() -> bool:
+    """True at or after 9:45 ET."""
+    n = _now_et()
+    freeze_dt = n.replace(hour=ORB_FREEZE_H, minute=ORB_FREEZE_M, second=0, microsecond=0)
+    return n >= freeze_dt
 
 
-# ─── Quote helpers ───────────────────────────────────────────────────────────
-
-def _safe_float(val) -> Optional[float]:
-    try:
-        return float(val)
-    except (TypeError, ValueError):
-        return None
+def _is_orb_open_minute() -> bool:
+    """True only during the 9:30 AM minute (first minute of session)."""
+    n = _now_et()
+    return n.hour == ORB_OPEN_H and n.minute == ORB_OPEN_M
 
 
-def get_quote(symbol: str) -> Optional[dict]:
-    rs = _rh()
-    try:
-        q = rs.get_stock_quote_by_symbol(symbol)
-        return q if q else None
-    except Exception as e:
-        log.debug(f"Quote error for {symbol}: {e}")
-        return None
+def _today_str() -> str:
+    return date.today().isoformat()   # "YYYY-MM-DD"
 
 
-def pct_change(q: dict) -> Optional[float]:
-    prev = _safe_float(q.get("previous_close"))
-    last = _safe_float(q.get("last_trade_price"))
-    if not prev or not last or prev == 0:
-        return None
-    return (last - prev) / prev
+# ─── Authentication ───────────────────────────────────────────────────────────
+
+def login() -> None:
+    username = os.environ["RH_USERNAME"]
+    password = os.environ["RH_PASSWORD"]
+    rs.login(username, password, expiresIn=86400, store_session=True)
+    log.info("Authenticated with Robinhood")
 
 
-def spread_pct(q: dict) -> Optional[float]:
-    ask = _safe_float(q.get("ask_price"))
-    bid = _safe_float(q.get("bid_price"))
-    if not ask or ask == 0:
-        return None
-    return (ask - bid) / ask
+# ─── Data fetchers ────────────────────────────────────────────────────────────
 
-
-def ask_price(q: dict) -> Optional[float]:
-    return _safe_float(q.get("ask_price"))
-
-
-# ─── Scanner ─────────────────────────────────────────────────────────────────
-
-def get_candidate_symbols() -> List[str]:
+async def fetch_batch_quotes(symbols: List[str]) -> Dict[str, dict]:
     """
-    Build a scan universe from:
-      1. Robinhood's curated 'top movers' list
-      2. S&P 500 up-movers
-    """
-    rs = _rh()
-    symbols: set = set()
+    Fetch real-time quotes for a list of symbols in one batch call.
 
+    Parameters
+    ----------
+    symbols : List of ticker strings.
+
+    Returns
+    -------
+    dict keyed by symbol, value is the raw quote dict from robin_stocks.
+    Returns an empty dict on total failure; individual missing quotes are
+    silently skipped.
+    """
+    loop = asyncio.get_event_loop()
     try:
-        for item in (rs.get_top_movers_robin_hood() or []):
-            sym = item.get("symbol", "")
-            if sym:
-                symbols.add(sym)
-    except Exception as e:
-        log.warning(f"Could not fetch RH top movers: {e}")
+        raw: list = await loop.run_in_executor(
+            _executor,
+            lambda: rs.get_quotes(symbols) or [],
+        )
+    except Exception as exc:
+        log_error("fetch_batch_quotes", exc)
+        return {}
 
-    try:
-        for item in (rs.get_movers_sp500(direction="up") or []):
-            sym = item.get("symbol", "")
-            if sym:
-                symbols.add(sym)
-    except Exception as e:
-        log.warning(f"Could not fetch S&P 500 up-movers: {e}")
+    result: Dict[str, dict] = {}
+    if not raw:
+        return result
 
-    log.info(f"Scan universe: {len(symbols)} symbols")
-    return list(symbols)
-
-
-def scan_movers(symbols: List[str]) -> Tuple[List[dict], List[dict]]:
-    """
-    Returns (momentum_list, large_mover_list) sorted by % gain descending.
-
-    momentum_list:    1% <= gain < 3%  AND  spread <= MAX_SPREAD_PCT
-    large_mover_list: gain >= 3%
-    """
-    momentum: List[dict] = []
-    large: List[dict] = []
-
-    for sym in symbols:
-        q = get_quote(sym)
+    for i, q in enumerate(raw):
         if not q:
             continue
+        sym = q.get("symbol") or (symbols[i] if i < len(symbols) else None)
+        if sym:
+            result[sym] = q
 
-        gain = pct_change(q)
-        if gain is None or gain < MOMENTUM_GAIN_THRESHOLD:
+    return result
+
+
+async def fetch_intraday_bars(symbol: str, interval: str = "5minute") -> List[dict]:
+    """
+    Fetch today's regular-session intraday bars for a symbol.
+
+    Parameters
+    ----------
+    symbol   : Ticker string.
+    interval : Bar interval ('5minute', '10minute', etc.).
+
+    Returns
+    -------
+    List of bar dicts filtered to today's regular session.
+    Each dict has keys: begins_at, open_price, close_price, high_price,
+    low_price, volume, session, interpolated, symbol.
+    """
+    loop = asyncio.get_event_loop()
+    today = _today_str()
+    try:
+        bars: list = await loop.run_in_executor(
+            _executor,
+            lambda: rs.get_stock_historicals(
+                symbol,
+                interval=interval,
+                span="day",
+                bounds="regular",
+            ) or [],
+        )
+    except Exception as exc:
+        log_error(f"fetch_intraday_bars({symbol})", exc)
+        return []
+
+    # Filter to today's regular-session bars only
+    filtered = [
+        b for b in bars
+        if b
+        and isinstance(b.get("begins_at"), str)
+        and b["begins_at"].startswith(today)
+        and b.get("session") == "reg"
+    ]
+    return filtered
+
+
+async def fetch_15min_bars(symbol: str) -> List[dict]:
+    """
+    Fetch 15-minute bars spanning one week for RSI computation.
+
+    We need a week of 15-min bars to seed the Wilder RSI with enough history
+    (14 periods × 15 min = 3.5 hours; one week gives ~130 bars for a clean
+    reading across sessions).
+
+    Parameters
+    ----------
+    symbol : Ticker string.
+
+    Returns
+    -------
+    List of bar dicts ordered oldest-first.
+    """
+    loop = asyncio.get_event_loop()
+    try:
+        bars: list = await loop.run_in_executor(
+            _executor,
+            lambda: rs.get_stock_historicals(
+                symbol,
+                interval="15minute",
+                span="week",
+                bounds="regular",
+            ) or [],
+        )
+    except Exception as exc:
+        log_error(f"fetch_15min_bars({symbol})", exc)
+        return []
+
+    return [b for b in bars if b]
+
+
+# ─── Phase handlers ───────────────────────────────────────────────────────────
+
+async def initialize_orb_window(quotes: Dict[str, dict]) -> None:
+    """
+    Called once at 9:30 AM.
+
+    For each symbol:
+      - Qualify Gap & Go (prev_close vs open_price)
+      - Set Reversal open price
+      - Seed ORB with the first quote price
+    """
+    log_phase("ORB_WINDOW_INIT", f"{len(quotes)} symbols quoted")
+
+    for symbol, q in quotes.items():
+        if symbol in INVERSE_ETF_SYMBOLS:
             continue
 
-        ask = ask_price(q)
-        if not ask or ask <= 0:
+        try:
+            prev_close  = float(q.get("previous_close") or 0)
+            open_price  = float(q.get("last_trade_price") or q.get("ask_price") or 0)
+        except (TypeError, ValueError):
             continue
 
-        spread = spread_pct(q)
-        if spread is None:
+        if open_price <= 0:
             continue
 
-        entry = dict(symbol=sym, gain=gain, ask=ask, spread=spread)
+        # Reversal: record open price
+        reversal_strat.set_open(symbol, open_price)
 
-        if gain >= LARGE_MOVER_THRESHOLD:
-            large.append(entry)
-        elif spread <= MAX_SPREAD_PCT:
-            # Fee guard: spread cost must not erase the 0.5% profit target
-            net = MOMENTUM_SELL_TARGET - spread
-            if net > 0:
-                momentum.append(entry)
+        # Gap & Go: register if gap >= 3%
+        if prev_close > 0:
+            gap_go_strat.qualify(symbol, prev_close, open_price)
+
+        # ORB: seed first price
+        orb_strat.update(symbol, open_price, in_window=True)
+
+    active_gap_symbols = gap_go_strat.get_active_symbols()
+    log.info("Gap&Go candidates at open: %d symbols — %s", len(active_gap_symbols), active_gap_symbols)
+
+
+async def scan_orb_window(quotes: Dict[str, dict]) -> None:
+    """
+    Called every POLL_INTERVAL_SECONDS during 9:30–9:45.
+
+    Updates ORB high/low and Gap & Go tracking for every quoted symbol.
+    """
+    now_str = _now_et().strftime("%H:%M:%S ET")
+    log.debug("ORB scan tick  %s  symbols=%d", now_str, len(quotes))
+
+    for symbol, q in quotes.items():
+        if symbol in INVERSE_ETF_SYMBOLS:
+            continue
+        try:
+            price = float(q.get("last_trade_price") or q.get("ask_price") or 0)
+        except (TypeError, ValueError):
+            continue
+        if price <= 0:
+            continue
+
+        orb_strat.update(symbol, price, in_window=True)
+        gap_go_strat.update(symbol, price)
+
+
+async def initialize_post_orb(quotes: Dict[str, dict]) -> None:
+    """
+    Called once at 9:45 AM.
+
+    1. Freeze ORB and Gap & Go boundaries for all symbols.
+    2. Fetch RSI (15-min bars) and VWAP (5-min bars) concurrently in
+       batches of 10 symbols.
+    3. Cache RSI values in the module-level rsi_cache dict.
+    4. Register VWAP bands with VWAPReversionStrategy.
+    """
+    global rsi_cache
+
+    log_phase("POST_ORB_INIT", "freezing ORB + computing RSI/VWAP")
+
+    # ── Freeze all symbols ───────────────────────────────────────────
+    all_symbols = [s for s in WATCHLIST if s not in INVERSE_ETF_SYMBOLS]
+    for symbol in all_symbols:
+        orb_strat.freeze(symbol)
+        gap_go_strat.freeze(symbol)
+
+    # ── Batch fetch RSI + VWAP concurrently ─────────────────────────
+    BATCH_SIZE = 10
+
+    async def process_symbol_indicators(symbol: str) -> None:
+        """Compute and store RSI and VWAP for one symbol."""
+        # RSI from 15-min bars
+        bars_15m = await fetch_15min_bars(symbol)
+        if bars_15m:
+            closes = []
+            for b in bars_15m:
+                try:
+                    closes.append(float(b["close_price"]))
+                except (KeyError, TypeError, ValueError):
+                    pass
+            if closes:
+                import numpy as np
+                rsi_val = calculate_rsi(np.array(closes))
+                rsi_cache[symbol] = rsi_val
             else:
-                log.debug(f"Skip {sym}: spread {spread:.3%} erases momentum target")
+                rsi_cache[symbol] = 50.0
+        else:
+            rsi_cache[symbol] = 50.0
 
-    momentum.sort(key=lambda x: x["gain"], reverse=True)
-    large.sort(key=lambda x: x["gain"], reverse=True)
-    return momentum, large
+        # VWAP from 5-min intraday bars
+        bars_5m = await fetch_intraday_bars(symbol, interval="5minute")
+        if bars_5m:
+            vwap, upper, lower = calculate_vwap_bands(bars_5m)
+            if vwap > 0:
+                vwap_rev.set_vwap(symbol, vwap, upper, lower)
 
+    # Process in batches to avoid hammering the API
+    for i in range(0, len(all_symbols), BATCH_SIZE):
+        batch = all_symbols[i : i + BATCH_SIZE]
+        tasks = [process_symbol_indicators(sym) for sym in batch]
+        await asyncio.gather(*tasks)
+        log.debug("post-ORB indicator batch %d/%d done", i // BATCH_SIZE + 1,
+                  (len(all_symbols) + BATCH_SIZE - 1) // BATCH_SIZE)
 
-# ─── Order helpers ───────────────────────────────────────────────────────────
-
-def _fill_info(order_id: str, fallback_ask: float, fallback_qty: float) -> Tuple[float, float]:
-    """Returns (filled_qty, avg_price) from a placed order."""
-    rs = _rh()
-    try:
-        # Give Robinhood a moment to process the market order
-        time.sleep(3)
-        info = rs.get_stock_order_info(order_id)
-        qty = float(info.get("filled_quantity") or 0)
-        price = float(info.get("average_price") or fallback_ask)
-        return qty, price
-    except Exception:
-        return fallback_qty, fallback_ask
-
-
-def buy_market(symbol: str, dollar_amount: float, approx_ask: float) -> Optional[str]:
-    rs = _rh()
-    qty = round(dollar_amount / approx_ask, 6)
-    if qty < 0.000001:
-        log.warning(f"Skipping {symbol}: computed qty {qty} too small")
-        return None
-    log.info(f"BUY MARKET {symbol}  qty={qty:.6f}  (~${dollar_amount:.2f})")
-    try:
-        order = rs.order_buy_fractional_by_quantity(
-            symbol,
-            qty,
-            account_number=ACCOUNT_NUMBER,
-            timeInForce="gfd",
-        )
-        if order and order.get("id"):
-            return order["id"]
-        log.error(f"Buy order returned unexpected response for {symbol}: {order}")
-        return None
-    except Exception as e:
-        log.error(f"Buy order exception for {symbol}: {e}")
-        return None
-
-
-def sell_limit(symbol: str, qty: float, limit: float) -> Optional[str]:
-    rs = _rh()
-    log.info(f"SELL LIMIT {symbol}  qty={qty:.6f}  limit=${limit:.4f}")
-    try:
-        # Robinhood fractional limit sells use sell_fractional_by_quantity
-        order = rs.order_sell_fractional_by_quantity(
-            symbol,
-            qty,
-            account_number=ACCOUNT_NUMBER,
-            timeInForce="gtc",  # GTC so it stays live after the trading window
-            limitPrice=limit,
-        )
-        if order and order.get("id"):
-            return order["id"]
-        log.error(f"Limit sell unexpected response for {symbol}: {order}")
-        return None
-    except Exception as e:
-        log.error(f"Limit sell exception for {symbol}: {e}")
-        return None
-
-
-def sell_stop_limit(symbol: str, qty: float, stop: float, limit: float) -> Optional[str]:
-    """
-    Stop-limit sell: triggers when price hits `stop`, then places a limit at `limit`.
-    NOTE: Robinhood does NOT support stop orders on fractional shares.
-    If qty is fractional, this will gracefully fall back and log a warning.
-    """
-    rs = _rh()
-    whole_qty = int(qty)  # stop orders require whole shares
-    if whole_qty < 1:
-        log.warning(
-            f"Cannot place stop-limit for {symbol}: fractional qty {qty:.6f} "
-            f"— monitor manually or via the Robinhood app."
-        )
-        return None
-
-    log.info(f"STOP-LIMIT SELL {symbol}  qty={whole_qty}  stop=${stop:.4f}  limit=${limit:.4f}")
-    try:
-        order = rs.order_sell_stop_limit(
-            symbol,
-            whole_qty,
-            limitPrice=limit,
-            stopPrice=stop,
-            account_number=ACCOUNT_NUMBER,
-            timeInForce="gtc",
-        )
-        if order and order.get("id"):
-            return order["id"]
-        log.error(f"Stop-limit unexpected response for {symbol}: {order}")
-        return None
-    except Exception as e:
-        log.error(f"Stop-limit exception for {symbol}: {e}")
-        return None
-
-
-# ─── Strategy: Momentum ───────────────────────────────────────────────────────
-
-def run_momentum(candidate: dict, buying_power: float) -> float:
-    """
-    Enter a momentum position. Returns the estimated buying-power consumed.
-    """
-    sym = candidate["symbol"]
-    ask = candidate["ask"]
-
-    if sym in _state.momentum_positions:
-        return 0.0
-    if len(_state.momentum_positions) >= MAX_MOMENTUM_POSITIONS:
-        log.info(f"Max momentum positions reached ({MAX_MOMENTUM_POSITIONS}), skip {sym}")
-        return 0.0
-
-    alloc = min(buying_power * MOMENTUM_ALLOC_PCT, buying_power)
-    if alloc < MIN_POSITION_USD:
-        return 0.0
-
-    buy_id = buy_market(sym, alloc, ask)
-    if not buy_id:
-        return 0.0
-
-    est_qty = round(alloc / ask, 6)
-    filled_qty, avg_price = _fill_info(buy_id, ask, est_qty)
-
-    if filled_qty <= 0:
-        log.warning(f"Momentum buy for {sym} shows 0 fill — may still be pending")
-        filled_qty = est_qty
-        avg_price = ask
-
-    target = round(avg_price * (1 + MOMENTUM_SELL_TARGET), 4)
-    sell_id = sell_limit(sym, filled_qty, target)
-
-    _state.momentum_positions[sym] = dict(
-        qty=filled_qty,
-        entry_price=avg_price,
-        target_price=target,
-        buy_order_id=buy_id,
-        sell_order_id=sell_id,
-    )
+    # ── Summary log ─────────────────────────────────────────────────
+    rsi_values_computed = len([v for v in rsi_cache.values() if v != 50.0])
     log.info(
-        f"[MOMENTUM] {sym}: {filled_qty:.6f} sh @ ${avg_price:.4f} "
-        f"→ limit sell @ ${target:.4f} (+0.5%)"
+        "[POST_ORB] Indicators ready: RSI computed for %d/%d symbols  "
+        "| Gap&Go active: %d",
+        rsi_values_computed,
+        len(all_symbols),
+        len(gap_go_strat.get_active_symbols()),
     )
-    return alloc
 
 
-# ─── Strategy: Large Mover ────────────────────────────────────────────────────
-
-def run_large_mover(candidate: dict, account_value: float, buying_power: float) -> float:
+async def check_signals(quotes: Dict[str, dict]) -> None:
     """
-    Enter a large-mover position. Returns estimated buying-power consumed.
+    Called every POST_ORB_POLL_SECONDS after 9:45.
+
+    For each symbol with a valid quote, evaluates all four strategies in
+    priority order and calls exec_eng.execute_signal() when triggered.
     """
-    sym = candidate["symbol"]
-    ask = candidate["ask"]
+    for symbol, q in quotes.items():
+        try:
+            price = float(q.get("last_trade_price") or q.get("ask_price") or 0)
+        except (TypeError, ValueError):
+            continue
+        if price <= 0:
+            continue
 
-    if sym in _state.large_mover_positions:
-        return 0.0
-    if len(_state.large_mover_positions) >= MAX_LARGE_MOVER_POSITIONS:
-        log.info(f"Max large-mover positions reached, skip {sym}")
-        return 0.0
+        # ── Strategy 1: ORB ──────────────────────────────────────────
+        if symbol not in INVERSE_ETF_SYMBOLS:
+            sig = orb_strat.check_signal(symbol, price, INVERSE_ETF_MAP)
+            if sig is not None:
+                # If INVERSE direction, reprice entry using current inverse quote
+                if sig.direction == "INVERSE":
+                    inv_q = quotes.get(sig.symbol)
+                    if inv_q:
+                        try:
+                            inv_price = float(inv_q.get("last_trade_price") or
+                                              inv_q.get("ask_price") or 0)
+                            if inv_price > 0:
+                                tp    = round(inv_price * (1 + orb_strat.TP_PCT), 4)
+                                sl_st = round(inv_price * (1 - orb_strat.SL_PCT), 4)
+                                sl_lm = round(sl_st * 0.995, 4)
+                                from strategies import Signal as _Sig
+                                sig = _Sig(
+                                    strategy=sig.strategy,
+                                    direction=sig.direction,
+                                    symbol=sig.symbol,
+                                    entry_price=inv_price,
+                                    tp_price=tp,
+                                    sl_stop=sl_st,
+                                    sl_limit=sl_lm,
+                                )
+                        except (TypeError, ValueError):
+                            pass
+                log_signal(sig)
+                await exec_eng.execute_signal(sig)
 
-    # 5% of start-of-day value, capped to available buying power
-    alloc = min(_state.start_of_day_value * LARGE_MOVER_ALLOC_PCT, buying_power)
-    if alloc < MIN_POSITION_USD:
-        log.warning(f"Insufficient funds for large-mover position in {sym}: ${alloc:.2f}")
-        return 0.0
+        # ── Strategy 2: Reversal ─────────────────────────────────────
+        if symbol not in INVERSE_ETF_SYMBOLS:
+            rsi = rsi_cache.get(symbol, 50.0)
+            sig = reversal_strat.check_signal(symbol, price, rsi, INVERSE_ETF_MAP)
+            if sig is not None:
+                if sig.direction == "INVERSE":
+                    inv_q = quotes.get(sig.symbol)
+                    if inv_q:
+                        try:
+                            inv_price = float(inv_q.get("last_trade_price") or
+                                              inv_q.get("ask_price") or 0)
+                            if inv_price > 0:
+                                tp    = round(inv_price * (1 + reversal_strat.TP_PCT), 4)
+                                sl_st = round(inv_price * (1 - reversal_strat.SL_PCT), 4)
+                                sl_lm = round(sl_st * 0.996, 4)
+                                from strategies import Signal as _Sig
+                                sig = _Sig(
+                                    strategy=sig.strategy,
+                                    direction=sig.direction,
+                                    symbol=sig.symbol,
+                                    entry_price=inv_price,
+                                    tp_price=tp,
+                                    sl_stop=sl_st,
+                                    sl_limit=sl_lm,
+                                )
+                        except (TypeError, ValueError):
+                            pass
+                log_signal(sig)
+                await exec_eng.execute_signal(sig)
 
-    buy_id = buy_market(sym, alloc, ask)
-    if not buy_id:
-        return 0.0
+        # ── Strategy 3: Gap and Go ───────────────────────────────────
+        if symbol not in INVERSE_ETF_SYMBOLS:
+            sig = gap_go_strat.check_signal(symbol, price)
+            if sig is not None:
+                log_signal(sig)
+                await exec_eng.execute_signal(sig)
 
-    est_qty = round(alloc / ask, 6)
-    filled_qty, avg_price = _fill_info(buy_id, ask, est_qty)
+        # ── Strategy 4: VWAP Reversion ───────────────────────────────
+        if symbol not in INVERSE_ETF_SYMBOLS:
+            sig = vwap_rev.check_signal(symbol, price)
+            if sig is not None:
+                log_signal(sig)
+                await exec_eng.execute_signal(sig)
 
-    if filled_qty <= 0:
-        log.warning(f"Large-mover buy for {sym} shows 0 fill — may still be pending")
-        filled_qty = est_qty
-        avg_price = ask
 
-    take_profit = round(avg_price * (1 + LARGE_MOVER_TAKE_PROFIT), 4)
-    stop_trigger = round(avg_price * (1 - LARGE_MOVER_STOP_PCT), 4)
-    stop_limit   = round(stop_trigger * (1 - LARGE_MOVER_STOP_LIMIT_OFFSET), 4)
+# ─── Portfolio value ──────────────────────────────────────────────────────────
 
-    tp_id = sell_limit(sym, filled_qty, take_profit)
-    sl_id = sell_stop_limit(sym, filled_qty, stop_trigger, stop_limit)
+async def _get_portfolio_value() -> float:
+    """
+    Fetch current portfolio value (market value + cash).
 
-    _state.large_mover_positions[sym] = dict(
-        qty=filled_qty,
-        entry_price=avg_price,
-        take_profit_price=take_profit,
-        stop_price=stop_trigger,
-        stop_limit_price=stop_limit,
-        buy_order_id=buy_id,
-        tp_order_id=tp_id,
-        sl_order_id=sl_id,
-    )
-    log.info(
-        f"[LARGE MOVER] {sym}: {filled_qty:.6f} sh @ ${avg_price:.4f} "
-        f"| TP: ${take_profit:.4f} (+10%) "
-        f"| SL: stop=${stop_trigger:.4f} / limit=${stop_limit:.4f} (-5%)"
-    )
-    if sl_id is None:
-        log.warning(
-            f"  ⚠  Stop-limit could not be placed for {sym} (fractional shares). "
-            f"Monitor price manually; sell if it drops below ${stop_trigger:.4f}."
+    Returns 0.0 on error.
+    """
+    loop = asyncio.get_event_loop()
+    try:
+        port = await loop.run_in_executor(
+            _executor,
+            lambda: rs.load_portfolio_profile(account_number=ACCOUNT_NUMBER),
         )
-    return alloc
+        if not port:
+            return 0.0
+        market_val = float(port.get("market_value") or 0)
+        cash       = float(port.get("cash") or 0)
+        return market_val + cash
+    except Exception as exc:
+        log_error("_get_portfolio_value", exc)
+        return 0.0
 
 
-# ─── Risk: daily loss guard ───────────────────────────────────────────────────
+async def check_daily_loss_limit() -> bool:
+    """
+    Check whether the daily loss limit has been breached.
 
-def loss_limit_breached(current_value: float) -> bool:
-    if _state.start_of_day_value <= 0:
+    Returns
+    -------
+    bool
+        True  → halt trading (loss >= MAX_DAILY_LOSS_PCT of start_of_day_value).
+        False → continue.
+    """
+    global start_of_day_value
+    if start_of_day_value <= 0:
         return False
-    loss_pct = (_state.start_of_day_value - current_value) / _state.start_of_day_value
-    if loss_pct >= DAILY_LOSS_LIMIT_PCT:
-        log.warning(
-            f"DAILY LOSS LIMIT HIT: -{loss_pct:.1%} "
-            f"(started=${_state.start_of_day_value:.2f}, now=${current_value:.2f}). "
-            f"No new entries for the rest of the day."
+
+    current_value = await _get_portfolio_value()
+    if current_value <= 0:
+        # Can't determine value; don't halt on bad data
+        return False
+
+    loss_pct = (start_of_day_value - current_value) / start_of_day_value
+    if loss_pct >= MAX_DAILY_LOSS_PCT:
+        log_halt(
+            f"Daily loss limit breached: -{loss_pct:.1%}  "
+            f"(start=${start_of_day_value:.2f}  now=${current_value:.2f})  "
+            f"threshold={MAX_DAILY_LOSS_PCT:.0%}"
         )
         return True
+
+    log.debug(
+        "Loss check: current=$%.2f  start=$%.2f  drawdown=%.2f%%",
+        current_value, start_of_day_value, loss_pct * 100,
+    )
     return False
 
 
-# ─── Main cycle ───────────────────────────────────────────────────────────────
+# ─── Main loop ────────────────────────────────────────────────────────────────
 
-def run_cycle():
-    if not is_market_open():
-        log.info("Market closed — skipping cycle.")
-        return
+async def main() -> None:
+    """
+    Async entry point.
 
-    current_value, buying_power = get_current_value_and_bp()
-    log.info(
-        f"Portfolio: ${current_value:.2f}  |  Buying power: ${buying_power:.2f}  "
-        f"|  Start-of-day: ${_state.start_of_day_value:.2f}"
-    )
+    Phase routing:
+      Before 9:30       → wait
+      9:30 (first tick) → initialize_orb_window
+      9:30–9:45         → scan_orb_window  (every POLL_INTERVAL_SECONDS)
+      9:45 (first tick) → initialize_post_orb
+      9:45–16:00        → check_signals    (every POST_ORB_POLL_SECONDS)
+      16:00             → market closed, exit loop
+    """
+    global start_of_day_value
 
-    if _state.trading_halted:
-        log.info("Trading halted for the day (loss limit). Existing orders remain active.")
-        return
+    log.info("=" * 70)
+    log.info("Agentic Trading Bot  (4-strategy intraday)")
+    log.info("=" * 70)
 
-    if loss_limit_breached(current_value):
-        _state.trading_halted = True
-        return
-
-    if not is_in_trading_window():
-        log.info("Outside 15-minute entry window. Monitoring open positions only.")
-        return
-
-    if buying_power < MIN_POSITION_USD:
-        log.info(f"Buying power ${buying_power:.2f} too low for new entries.")
-        return
-
-    symbols = get_candidate_symbols()
-    if not symbols:
-        log.warning("No candidates returned by scanner.")
-        return
-
-    momentum_candidates, large_mover_candidates = scan_movers(symbols)
-    log.info(
-        f"Movers found: {len(large_mover_candidates)} large, "
-        f"{len(momentum_candidates)} momentum"
-    )
-
-    # Large movers get priority (higher upside, sized at 5% of account)
-    for c in large_mover_candidates[:MAX_LARGE_MOVER_POSITIONS]:
-        spent = run_large_mover(c, current_value, buying_power)
-        buying_power = max(0.0, buying_power - spent)
-
-    # Momentum trades fill remaining budget
-    for c in momentum_candidates:
-        if buying_power < MIN_POSITION_USD:
-            break
-        spent = run_momentum(c, buying_power)
-        buying_power = max(0.0, buying_power - spent)
-
-
-# ─── Initialization ───────────────────────────────────────────────────────────
-
-def initialize():
+    # ── Authentication ───────────────────────────────────────────────
     login()
-    value, _ = get_current_value_and_bp()
-    _state.start_of_day_value = value
-    log.info(f"Start-of-day account value: ${value:.2f}")
 
-    log.info("Configuration summary:")
-    log.info(f"  Entry window:        first {TRADING_WINDOW_MINUTES} min after open")
-    log.info(f"  Update interval:     every {UPDATE_INTERVAL_SECONDS // 60} min")
-    log.info(f"  Momentum threshold:  >= {MOMENTUM_GAIN_THRESHOLD:.0%} gain")
-    log.info(f"  Momentum target:     +{MOMENTUM_SELL_TARGET:.1%} (limit sell)")
-    log.info(f"  Max spread allowed:  {MAX_SPREAD_PCT:.2%} (fee guard)")
-    log.info(f"  Momentum alloc:      {MOMENTUM_ALLOC_PCT:.0%} of buying power / trade")
-    log.info(f"  Large-mover entry:   >= {LARGE_MOVER_THRESHOLD:.0%} gain")
-    log.info(f"  Large-mover alloc:   {LARGE_MOVER_ALLOC_PCT:.0%} of account (${value * LARGE_MOVER_ALLOC_PCT:.2f})")
-    log.info(f"  Take-profit:         +{LARGE_MOVER_TAKE_PROFIT:.0%}")
-    log.info(f"  Stop-loss:           -{LARGE_MOVER_STOP_PCT:.0%} (stop-limit)")
-    log.info(f"  Daily loss halt:     >= {DAILY_LOSS_LIMIT_PCT:.0%} drawdown from today's open")
+    # ── Start-of-day snapshot ────────────────────────────────────────
+    start_of_day_value = await _get_portfolio_value()
+    log.info("Start-of-day portfolio value: $%.2f", start_of_day_value)
+    log_cash(risk_mgr.get_buying_power(), label="open")
 
-
-# ─── Entry point ─────────────────────────────────────────────────────────────
-
-def main():
-    log.info("=" * 60)
-    log.info("Agentic Trading Bot starting up")
-    log.info("=" * 60)
-
-    initialize()
+    # ── Phase tracking ───────────────────────────────────────────────
+    orb_initialized   = False
+    post_orb_initialized = False
+    trading_halted    = False
 
     while True:
-        log.info("-" * 40)
         try:
-            run_cycle()
-        except KeyboardInterrupt:
-            log.info("Shutdown requested — exiting.")
-            break
-        except Exception as e:
-            log.error(f"Unhandled error in cycle: {e}", exc_info=True)
+            now_et = _now_et()
 
-        log.info(f"Next cycle in {UPDATE_INTERVAL_SECONDS // 60} minutes.")
-        time.sleep(UPDATE_INTERVAL_SECONDS)
+            # ── Market closed ────────────────────────────────────────
+            if not _is_market_open():
+                # If we've been running and the market just closed, exit cleanly
+                if orb_initialized:
+                    log.info("Market closed — shutting down.")
+                    break
+                log.info("Waiting for market open at 09:30 ET …")
+                await asyncio.sleep(POLL_INTERVAL_SECONDS)
+                continue
+
+            # ── Daily loss guard ─────────────────────────────────────
+            if not trading_halted and post_orb_initialized:
+                trading_halted = await check_daily_loss_limit()
+                if trading_halted:
+                    log_phase("HALTED", "no new entries for remainder of session")
+
+            # ── Fetch quotes for all 100 symbols ─────────────────────
+            quotes = await fetch_batch_quotes(WATCHLIST)
+            if not quotes:
+                log.warning("Empty quote batch; retrying after sleep.")
+                await asyncio.sleep(POLL_INTERVAL_SECONDS)
+                continue
+
+            log.debug("Fetched %d/%d quotes", len(quotes), len(WATCHLIST))
+
+            # ── Phase: ORB window (9:30–9:45) ────────────────────────
+            if _in_orb_window():
+                if not orb_initialized:
+                    await initialize_orb_window(quotes)
+                    orb_initialized = True
+                    log_phase("ORB_WINDOW", "tracking high/low")
+                else:
+                    await scan_orb_window(quotes)
+
+                # Check fills even during ORB (rare but possible from previous day)
+                await exec_eng.check_fills()
+                await asyncio.sleep(POLL_INTERVAL_SECONDS)
+
+            # ── Phase: Post-ORB (9:45–16:00) ─────────────────────────
+            elif _past_orb():
+                if not post_orb_initialized:
+                    await initialize_post_orb(quotes)
+                    post_orb_initialized = True
+                    log_phase("POST_ORB", "scanning signals")
+
+                if not trading_halted:
+                    await check_signals(quotes)
+
+                await exec_eng.check_fills()
+
+                bp = risk_mgr.get_buying_power()
+                log_cash(bp, label="cycle")
+
+                await asyncio.sleep(POST_ORB_POLL_SECONDS)
+
+            else:
+                # Fractional minute before 9:30 — shouldn't normally occur
+                await asyncio.sleep(5)
+
+        except KeyboardInterrupt:
+            log.info("KeyboardInterrupt — shutting down.")
+            break
+        except Exception as exc:
+            log_error("main loop", exc)
+            await asyncio.sleep(POLL_INTERVAL_SECONDS)
+
+    log.info("Bot stopped.  Execution log: execution_log.txt")
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
