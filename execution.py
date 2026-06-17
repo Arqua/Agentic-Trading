@@ -54,6 +54,10 @@ class ExecutionEngine:
     def __init__(self, account_number: str, risk_mgr) -> None:
         self.account_number = account_number
         self.risk_mgr       = risk_mgr
+        # Keyed by buy_order_id (NOT symbol) so multiple concurrent positions
+        # on the same symbol — e.g. one strategy's bracket still open when
+        # another strategy signals the same ticker — are tracked independently
+        # instead of one silently overwriting the other.
         self.positions:     Dict[str, Position] = {}
         self._pending_fills: set = set()   # buy order_ids awaiting fill confirmation
 
@@ -171,7 +175,7 @@ class ExecutionEngine:
             sl_limit_price=signal.sl_limit,
             alloc_usd=alloc_usd,
         )
-        self.positions[signal.symbol] = pos
+        self.positions[order_id] = pos
         self._pending_fills.add(order_id)
 
         self.risk_mgr.record_buy(order_id, alloc_usd)
@@ -187,7 +191,7 @@ class ExecutionEngine:
         log_cash(available_bp - alloc_usd, label="post-buy estimate")
         return order_id
 
-    async def place_bracket(self, symbol: str) -> None:
+    async def place_bracket(self, order_id: str) -> None:
         """
         Place take-profit (TP) and stop-loss (SL) orders for an open position.
 
@@ -195,12 +199,19 @@ class ExecutionEngine:
         SL:  GTC stop-limit sell (whole shares only; logs warning if fractional)
 
         Called automatically by check_fills() when a buy order is confirmed.
+
+        Parameters
+        ----------
+        order_id : The buy order's ID — the key into self.positions. Using the
+                   order_id (rather than symbol) lets two concurrent positions
+                   on the same symbol each get their own bracket.
         """
-        pos = self.positions.get(symbol)
+        pos = self.positions.get(order_id)
         if not pos:
-            log.warning("place_bracket: no position found for %s", symbol)
+            log.warning("place_bracket: no position found for order_id %s", order_id)
             return
 
+        symbol        = pos.symbol
         qty           = pos.qty
         tp_price      = pos.tp_price
         sl_stop_price = pos.sl_stop_price
@@ -290,23 +301,18 @@ class ExecutionEngine:
 
             if state == "filled" and filled_qty > 0:
                 filled_ids.add(order_id)
-                # Find the matching position
-                symbol = None
-                for sym, pos in self.positions.items():
-                    if pos.buy_order_id == order_id:
-                        symbol = sym
-                        # Update position with actual fill data
-                        pos.qty          = filled_qty
-                        pos.entry_price  = avg_price
-                        break
+                pos = self.positions.get(order_id)
 
-                if symbol:
-                    log_fill(symbol, filled_qty, avg_price, order_id)
+                if pos:
+                    # Update position with actual fill data
+                    pos.qty         = filled_qty
+                    pos.entry_price = avg_price
+                    log_fill(pos.symbol, filled_qty, avg_price, order_id)
                     log.info(
                         "[FILL CONFIRMED] %s  qty=%.6f  avg=%.4f — placing bracket",
-                        symbol, filled_qty, avg_price,
+                        pos.symbol, filled_qty, avg_price,
                     )
-                    await self.place_bracket(symbol)
+                    await self.place_bracket(order_id)
                 else:
                     log.warning(
                         "check_fills: order %s filled but no matching position found",
