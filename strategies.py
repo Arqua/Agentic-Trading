@@ -10,6 +10,8 @@ Module 4: VWAPReversionStrategy — VWAP Mean Reversion
 from collections import namedtuple
 import logging
 
+from indicators import consolidation_check
+
 log = logging.getLogger(__name__)
 
 # ─── Signal namedtuple ────────────────────────────────────────────────────────
@@ -299,19 +301,25 @@ class GapAndGoStrategy:
     """
     Gap and Go: buy continuation of a large opening gap if:
       - Gap >= 3% at open
-      - Price broke above the ORB high
+      - Price consolidated tightly during the ORB window without filling
+        more than half the gap (see indicators.consolidation_check) — this
+        filters out choppy opens that are likely to fake out on breakout
+      - Price broke above the ORB high by BREAKOUT_BUFFER_PCT of price
       - Gap was NOT filled during the ORB window (no print at or below prev_close)
 
     State per symbol:
       prev_close, open_price, orb_high, orb_low,
-      gap_pct, gap_filled, established, triggered
+      gap_pct, gap_filled, established, frozen, triggered, consolidated
     """
 
     ALLOC_PCT: float = 0.05   # 5% of account
     TP_PCT:    float = 0.10   # +10%
     SL_PCT:    float = 0.05   # -5%
 
-    MIN_GAP_PCT: float = 0.03  # 3% gap threshold
+    MIN_GAP_PCT: float = 0.03   # 3% gap threshold
+    BREAKOUT_BUFFER_PCT: float = 0.0005  # 0.05% above ORB high, scaled to price
+                                          # (was a flat $0.01 — meaningless for a
+                                          # $300 stock, too wide for a $5 one)
 
     def __init__(self):
         self._prev_close:   dict = {}
@@ -323,6 +331,7 @@ class GapAndGoStrategy:
         self._established:  dict = {}
         self._frozen:       dict = {}
         self._triggered:    dict = {}
+        self._consolidated: dict = {}
 
     # ------------------------------------------------------------------
 
@@ -368,24 +377,40 @@ class GapAndGoStrategy:
             self._gap_filled[symbol] = True
 
     def freeze(self, symbol: str) -> None:
-        """Lock boundaries at 9:45."""
+        """
+        Lock boundaries at 9:45 and evaluate whether the ORB window
+        consolidated tightly (see indicators.consolidation_check) instead of
+        chopping around — only tight, gap-held bases are eligible to trade.
+        """
         if self._established.get(symbol):
             self._frozen[symbol] = True
+            self._consolidated[symbol] = consolidation_check(
+                highs=[self._orb_high.get(symbol, 0.0)],
+                lows=[self._orb_low.get(symbol, 0.0)],
+                open_price=self._open_price.get(symbol, 0.0),
+                gap_pct=self._gap_pct.get(symbol, 0.0),
+            )
             log.debug(
-                "GAP&GO frozen  %s  orb_high=%.4f  gap_filled=%s",
+                "GAP&GO frozen  %s  orb_high=%.4f  gap_filled=%s  consolidated=%s",
                 symbol,
                 self._orb_high.get(symbol, 0),
                 self._gap_filled.get(symbol, False),
+                self._consolidated.get(symbol, False),
             )
 
     def check_signal(
         self,
         symbol: str,
         price: float,
-        tick_size: float = 0.01,
+        buffer_pct: float = None,
     ) -> "Signal | None":
         """
-        After freeze: fire LONG if price breaks above ORB high with gap intact.
+        After freeze: fire LONG if price breaks above ORB high with gap
+        intact AND the window consolidated tightly.
+
+        The breakout buffer scales with price (BREAKOUT_BUFFER_PCT by
+        default) rather than a flat cent amount, so it means roughly the
+        same thing for a $10 stock as a $300 one.
         """
         if not self._frozen.get(symbol):
             return None
@@ -393,12 +418,17 @@ class GapAndGoStrategy:
             return None
         if self._gap_filled.get(symbol):
             return None
+        if not self._consolidated.get(symbol):
+            return None
 
         orb_high = self._orb_high.get(symbol)
         if orb_high is None:
             return None
 
-        if price > orb_high + tick_size:
+        pct = buffer_pct if buffer_pct is not None else self.BREAKOUT_BUFFER_PCT
+        buffer = orb_high * pct
+
+        if price > orb_high + buffer:
             self._triggered[symbol] = True
             entry    = round(price, 4)
             tp       = round(entry * (1 + self.TP_PCT), 4)
