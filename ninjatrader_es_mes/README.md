@@ -58,12 +58,17 @@ The v1 code was re-audited top to bottom. Findings and fixes:
    executes on **MES while account buying power ≤ $20,000** and on ES only
    above that threshold (`BuyingPowerSwitchUsd`).
 
-4. **Catastrophic stop cap at 5% of buying power.** The protective stop
-   order is placed **one tick above the price at which a full stop-out —
-   fees included — would consume 5% of current buying power**
-   (`BpStopCapPct`). The ATR stop stands when it is already tighter; if
-   even the capped stop would leave less than a few ticks of room, the
-   trade is skipped and logged rather than entered with a nonsense stop.
+4. **Catastrophic sell-off at 5% of buying power.** The protective stop
+   sits at **exactly the price where adverse movement equals 5% of current
+   buying power** (`BpStopCapPct`) — the position sells off AT that loss
+   (e.g. $12.50 on a $250 account), with fees landing on top rather than
+   shrinking the stop. The ATR stop stands when it is already tighter.
+   When the cap cannot give the chosen size enough stop room, **size is
+   reduced contract by contract first**; only when even a 1-lot cannot get
+   `min_stop_ticks` of room is the trade skipped and logged. (Earlier v2
+   placed the stop one tick above the 5% point net of fees and used a hard
+   10x-fee viability gate, which silently blocked sub-$400 accounts; the
+   gate is now the tunable `min_r_fee_mult`, default 3x.)
 
 ---
 
@@ -83,11 +88,11 @@ tradeable volatility.
 | Trend filter | EMA(50) on ES 5-min — longs only above it, shorts only below it |
 | Volatility filter | ATR(14) within `[MinAtrTicks, MaxAtrTicks]` |
 | Entry | Market order after a close through `orb_high + buffer` / `orb_low − buffer`; one attempt per side per day; cutoff 11:30 ET |
-| Initial stop | `max(1.5×ATR, 0.5×ORB range)`, then **capped so a full stop-out (incl. fees) costs just under 5% of buying power** |
+| Initial stop | `max(1.5×ATR, 0.5×ORB range)`, then **capped so the position sells off at exactly 5% of buying power** (size reduces first when the cap can't fit the quantity) |
 | Target / trail | 2R fixed target; at +1R, 50% scales out, stop → breakeven, remainder trails 1.25×ATR |
 | Session control | No entries after 11:30 ET; flatten at 15:55 ET — no overnight exposure |
 | Position sizing | `floor(RiskPerTradeUsd / (stop_pts × PointValue + round_turn_fee))`, capped at `MaxContracts` |
-| Fee guards | Sizing is net of round-turn fees; daily loss limit is fee-inclusive; trades whose 1R gross < 10× round-turn fee are skipped |
+| Fee guards | Sizing is net of round-turn fees; daily loss limit is fee-inclusive; trades whose 1R gross < 3× round-turn fee (`min_r_fee_mult`) are skipped |
 | Guardrails | Daily loss limit; max 2 trades/day; requires both ES and MES series or refuses to run |
 
 ### 1.1 Installing it in NinjaTrader 8
@@ -170,9 +175,9 @@ so the MES-first rule is exercised. All entries/exits verified inside
 
 | Run | Execution | Trades | Win rate | Profit factor | Net P&L | Return | Max DD | Longest losing streak |
 |---|---|---|---|---|---|---|---|---|
-| `DUAL_5m_60d` | **all 63 on MES** (equity never crossed $20k) | 63 (+23 scale legs) | 39.7% | 1.083 | **+$1,050** | +10.5% | $2,898 (29.0%) | 6 |
-| `ES_5m_60d_ref` | pinned to ES (rule ignored) | 63 | 23.8% | 0.491 | **−$7,033** | −70.3% | $7,254 (72.5%) | 11 |
-| `DUAL_1h_730d` | all 325 on MES | 325 (+16 scale legs) | 50.8% | 1.099 | **+$3,510** | +35.1% | $3,166 (28.5%) | 6 |
+| `DUAL_5m_60d` | **all 63 on MES** (equity never crossed $20k) | 63 (+23 scale legs) | 39.7% | 1.135 | **+$1,750** | +17.5% | $2,850 (28.5%) | 6 |
+| `ES_5m_60d_ref` | pinned to ES (rule ignored) | 63 | 23.8% | 0.489 | **−$7,284** | −72.8% | $7,514 (75.1%) | 11 |
+| `DUAL_1h_730d` | all 325 on MES | 325 (+16 scale legs) | 50.5% | 1.087 | **+$3,118** | +31.2% | $3,633 (35.4%) | 6 |
 
 Full stats in `backtest/output/results.json`; equity curves in
 `equity_*.png`; per-trade logs in `trades_*.csv`.
@@ -188,9 +193,29 @@ smaller unit lets the cap breathe. **The $20k threshold is not cosmetic —
 below it, ES sizing genuinely cannot fit inside a sane risk envelope.**
 
 Note the MES→ES switchover never fired: neither dual run's equity crossed
-$20,000 in-sample ($11.0k / $13.5k peaks). The routing logic is exercised
-every trade (it evaluates and picks MES); the ES branch is exercised by
-the reference run.
+$20,000 in-sample. The routing logic is exercised every trade (it
+evaluates and picks MES); the ES branch is exercised by the reference run.
+
+### 3.1 Small-account behavior (the 5% sell-off cap in action)
+
+`python run_backtest.py --equity 250` runs the same DUAL 5-min backtest
+from a $250 balance:
+
+| Balance | Trades | Skipped | Outcome |
+|---|---|---|---|
+| $250 | 17 | 46 | **−$152 (−61%), win rate 11.8%, frozen at $97.69 by 6/12** |
+
+With the sell-off cap at exactly 5% of buying power, a $250 account can
+trade — 1 MES contract with a 2.5-point stop — but that stop is a quarter
+of the ~10-point ATR stop the entries were designed around, so routine
+noise clips it (2 wins in 17 trades). Each loss shrinks buying power and
+therefore the next stop, until equity reaches ~$100, where 5% can no
+longer buy even a 1-point stop and the guards freeze the account (all 46
+remaining signals skipped). This is the same death-by-tight-stops
+mechanism as the ES reference run, in miniature — the cap contains each
+individual loss exactly as specified, but it cannot manufacture edge at a
+size where the designed stop doesn't fit. Practical floor for this
+strategy remains roughly $8k–$10k.
 
 ---
 

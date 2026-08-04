@@ -313,11 +313,13 @@ class Backtest:
           1. stop_dist = max(ATR stop, half the opening range).
           2. qty from the risk budget NET of round-turn fees:
              floor(risk / (stop_dist * point_value + round_turn_fee)).
-          3. 5% cap: the stop may never sit farther than the price at which
-             a full stop-out (loss + fees) consumes bp_stop_cap_pct of
-             buying power — the stop is placed one tick above that point.
-             If that cap leaves less than min_stop_ticks of room, skip.
-          4. Fee viability: skip if 1R gross < 10x the round-turn fee.
+          3. Sell-off cap: the stop sits at exactly the price where adverse
+             movement equals bp_stop_cap_pct of buying power — the position
+             sells off AT that loss (e.g. $12.50 on a $250 account); fees
+             land on top of it rather than shrinking the stop. If the cap
+             cannot give the chosen size at least min_stop_ticks of room,
+             SIZE is reduced first; only an unworkable 1-lot is skipped.
+          4. Fee sanity: skip if 1R gross < min_r_fee_mult x round-turn fee.
         """
         p = self.p
         stop_dist = max(p.atr_stop_mult * atr_val, min_stop_floor)
@@ -328,13 +330,16 @@ class Backtest:
         qty = max(1, min(qty, p.max_contracts))
 
         max_loss = p.bp_stop_cap_pct * buying_power
-        cap_dist = (max_loss - rt_fee * qty) / (spec.point_value * qty) - spec.tick_size
+        min_stop = p.min_stop_ticks * spec.tick_size
+        while qty > 1 and max_loss / (spec.point_value * qty) < min_stop:
+            qty -= 1
+        cap_dist = max_loss / (spec.point_value * qty)
         if cap_dist < stop_dist:
-            if cap_dist < p.min_stop_ticks * spec.tick_size:
+            if cap_dist < min_stop:
                 return None
             stop_dist = cap_dist
 
-        if stop_dist * spec.point_value < 10 * rt_fee:
+        if stop_dist * spec.point_value < p.min_r_fee_mult * rt_fee:
             return None
         return qty, stop_dist
 

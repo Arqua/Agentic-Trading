@@ -33,11 +33,13 @@ using NinjaTrader.NinjaScript.Strategies;
 //    are folded into position sizing, the daily loss limit, and a
 //    viability guard that skips trades whose 1R gross profit would not
 //    cover at least 10x the round-turn fee.
-//  * Catastrophic stop cap: the protective stop is never placed farther
-//    away than one tick above the price at which a full stop-out
-//    (including fees) would consume BpStopCapPct (5%) of current buying
-//    power. If the ATR stop is already tighter it stands; if even the
-//    capped stop would be tighter than 2 ticks, the trade is skipped.
+//  * Catastrophic sell-off cap: the protective stop sits at exactly the
+//    price where adverse movement equals BpStopCapPct (5%) of current
+//    buying power — the position sells off AT that loss (e.g. $12.50 on a
+//    $250 account); fees land on top rather than shrinking the stop. If
+//    the cap cannot give the chosen size enough stop room, size is
+//    reduced contract by contract first; only an unworkable 1-lot is
+//    skipped. The ATR stop stands whenever it is already tighter.
 //
 // Core rules (unchanged from v1)
 // ------------------------------
@@ -123,6 +125,11 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Range(0.1, 25)]
         [Display(Name = "Catastrophic stop cap (% of buying power)", GroupName = "3. Risk / Exit", Order = 5)]
         public double BpStopCapPct { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(1, 100)]
+        [Display(Name = "Min 1R profit as multiple of round-turn fee", GroupName = "3. Risk / Exit", Order = 6)]
+        public double MinRewardToFeeMult { get; set; }
 
         [NinjaScriptProperty]
         [Range(1, 100000)]
@@ -230,6 +237,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 RewardRiskRatio = 2.0;
                 ScaleOutPct = 50;
                 BpStopCapPct = 5.0;
+                MinRewardToFeeMult = 3.0;
                 RiskPerTradeUsd = 500;
                 MaxContracts = 5;
                 BuyingPowerSwitchUsd = 20000;
@@ -425,17 +433,22 @@ namespace NinjaTrader.NinjaScript.Strategies
             int qty = (int)Math.Floor(RiskPerTradeUsd / perContractRisk);
             qty = Math.Max(1, Math.Min(qty, MaxContracts));
 
-            // Catastrophic cap: stop must sit one tick above the price at
-            // which a full stop-out (incl. fees) consumes BpStopCapPct of
-            // buying power.
+            // Sell-off cap: the stop sits at exactly the price where the
+            // position's adverse movement equals BpStopCapPct of buying
+            // power — it sells off AT that loss (fees land on top). If the
+            // cap can't give the chosen size enough stop room, reduce size
+            // before giving up; skip only when even a 1-lot is unworkable.
             double maxLoss = (BpStopCapPct / 100.0) * bp;
-            double capDist = (maxLoss - rtFee * qty) / (pv * qty) - TickSize;
+            double minStop = 4 * TickSize;
+            while (qty > 1 && maxLoss / (pv * qty) < minStop)
+                qty--;
+            double capDist = maxLoss / (pv * qty);
             if (capDist < stopDist)
             {
-                if (capDist < 2 * TickSize)
+                if (capDist < minStop)
                 {
                     Log(string.Format(
-                        "Entry skipped: 5%% BP cap leaves no stop room (bp={0:C}, capDist={1:0.00}pts)",
+                        "Entry skipped: 5%% BP sell-off cap leaves no stop room (bp={0:C}, capDist={1:0.00}pts)",
                         bp, capDist), NinjaTrader.Cbi.LogLevel.Warning);
                     if (isLong) longTriggeredToday = true; else shortTriggeredToday = true;
                     return;
@@ -443,10 +456,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                 stopDist = capDist;
             }
 
-            // Fee viability: 1R gross must cover >= 10x the round-turn fee.
-            if (stopDist * pv < 10 * rtFee)
+            // Fee sanity: 1R gross must cover >= MinRewardToFeeMult x the round-turn fee.
+            if (stopDist * pv < MinRewardToFeeMult * rtFee)
             {
-                Log("Entry skipped: expected 1R profit does not clear 10x round-turn fees.",
+                Log("Entry skipped: expected 1R profit does not clear MinRewardToFeeMult x round-turn fees.",
                     NinjaTrader.Cbi.LogLevel.Warning);
                 if (isLong) longTriggeredToday = true; else shortTriggeredToday = true;
                 return;

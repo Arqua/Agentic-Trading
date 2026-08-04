@@ -79,10 +79,13 @@ class Params:
     # Account, routing and catastrophic-stop rules
     starting_equity_usd: float = 10_000.0
     bp_switch_threshold_usd: float = 20_000.0  # trade MES at/below this buying power, ES above
-    bp_stop_cap_pct: float = 0.05              # stop placed just above the price where a
-                                                # full stop-out would consume 5% of buying power
-    min_stop_ticks: int = 4                    # if the 5% cap can't leave even this much
+    bp_stop_cap_pct: float = 0.05              # position sells off at exactly this fraction of
+                                                # buying power in adverse movement ($12.50 on a
+                                                # $250 account); fees land on top of the loss
+    min_stop_ticks: int = 4                    # if the cap can't give even a 1-lot this much
                                                 # stop room, skip the trade entirely
+    min_r_fee_mult: float = 3.0                # skip trades whose 1R gross profit is under
+                                                # this multiple of the round-turn fee
 
     # Signal-series tick size (ES and MES both tick in 0.25)
     tick_size: float = 0.25

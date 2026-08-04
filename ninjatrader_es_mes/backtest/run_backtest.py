@@ -111,7 +111,18 @@ def main():
     refresh = "--refresh" in sys.argv
     results = []
 
+    # Optional: --equity N adds a DUAL 5-min run at that starting balance
+    # (e.g. --equity 250) alongside the standard runs.
+    extra_equity = None
+    if "--equity" in sys.argv:
+        extra_equity = float(sys.argv[sys.argv.index("--equity") + 1])
+
     results.append(run_one("DUAL_5m_60d", "60d", "5m", refresh=refresh))
+
+    if extra_equity is not None:
+        results.append(run_one(f"EQ{int(extra_equity)}_5m_60d", "60d", "5m",
+                                refresh=refresh,
+                                param_overrides={"starting_equity_usd": extra_equity}))
 
     results.append(run_one("ES_5m_60d_ref", "60d", "5m", refresh=refresh,
                             force_instrument="ES"))
