@@ -3,8 +3,8 @@
     "label": "DUAL_5m_60d",
     "signal_symbol": "ES=F",
     "interval": "5m",
-    "n_signal_bars": 3814,
-    "n_mes_bars": 3814,
+    "n_signal_bars": 3816,
+    "n_mes_bars": 3816,
     "force_instrument": null,
     "params": {
       "orb_minutes": "15",
@@ -796,8 +796,8 @@
     "label": "ES_5m_60d_ref",
     "signal_symbol": "ES=F",
     "interval": "5m",
-    "n_signal_bars": 3814,
-    "n_mes_bars": 3814,
+    "n_signal_bars": 3816,
+    "n_mes_bars": 3816,
     "force_instrument": "ES",
     "params": {
       "orb_minutes": "15",
@@ -1761,21 +1761,21 @@
     "stats": {
       "n_trades": 325,
       "n_scale_legs": 16,
-      "total_pnl_usd": 3509.65,
+      "total_pnl_usd": 3513.4,
       "win_rate": 0.5077,
       "profit_factor": 1.099,
-      "avg_win_usd": 209.56,
+      "avg_win_usd": 209.58,
       "avg_loss_usd": -222.59,
-      "expectancy_usd": -3.19,
+      "expectancy_usd": -3.18,
       "max_drawdown_usd": 3166.11,
       "max_drawdown_pct": 28.53,
       "trading_days": 325,
       "daily_sharpe_annualized": 0.557,
       "longest_losing_streak": 6,
       "avg_r_multiple": -0.72,
-      "ending_equity": 13509.65,
+      "ending_equity": 13513.4,
       "starting_equity": 10000.0,
-      "total_return_pct": 35.1
+      "total_return_pct": 35.13
     },
     "failure_analysis": {
       "tagged_losses": [
