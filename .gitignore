@@ -15,3 +15,5 @@ build/
 execution_log.txt
 # Claude Code internal state
 .claude/
+# Cached raw market data (regenerate with `python data.py` / `run_backtest.py --refresh`)
+ninjatrader_es_mes/backtest/data/*.csv

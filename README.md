@@ -2,6 +2,8 @@
 
 Claude AI-powered trading bot for Robinhood — executes a momentum + large-mover intraday strategy on an agentic-enabled account.
 
+> **Also in this repo:** [`ninjatrader_es_mes/`](ninjatrader_es_mes/) — a NinjaTrader 8 NinjaScript strategy for ES/MES futures (opening-range breakout + trend/ATR filters), plus a Python backtest harness and a systemic-vs-one-off failure analysis of the results. See that directory's README for details.
+
 ---
 
 ## Strategy overview
