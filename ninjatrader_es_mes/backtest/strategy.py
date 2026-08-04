@@ -32,6 +32,30 @@ from zoneinfo import ZoneInfo
 ET = ZoneInfo("America/New_York")
 
 
+@dataclass(frozen=True)
+class InstrumentSpec:
+    """
+    Per-contract economics, including the full per-order fee stack.
+
+    fee_per_side is the all-in cost of one fill on one contract:
+      broker commission + CME exchange & clearing fee + NFA regulatory fee.
+    Defaults use NinjaTrader brokerage's free-license plan plus published
+    CME/NFA fees (2025 schedule):
+        ES : $1.29 commission + $1.40 exchange/clearing + $0.02 NFA = $2.71/side
+        MES: $0.35 commission + $0.37 exchange/clearing + $0.02 NFA = $0.74/side
+    i.e. round-turn ≈ $5.42 (ES) / $1.48 (MES). Swap in your broker's actual
+    schedule via these fields.
+    """
+    name: str
+    point_value: float
+    fee_per_side: float
+    tick_size: float = 0.25
+
+
+ES_SPEC = InstrumentSpec("ES", 50.0, 2.71)
+MES_SPEC = InstrumentSpec("MES", 5.0, 0.74)
+
+
 @dataclass
 class Params:
     orb_minutes: int = 15
@@ -52,13 +76,21 @@ class Params:
     flatten_time: dtime = dtime(15, 55)
     session_open: dtime = dtime(9, 30)
 
-    # Instrument economics
-    tick_size: float = 0.25
-    point_value: float = 50.0   # ES = 50, MES = 5
+    # Account, routing and catastrophic-stop rules
+    starting_equity_usd: float = 10_000.0
+    bp_switch_threshold_usd: float = 20_000.0  # trade MES at/below this buying power, ES above
+    bp_stop_cap_pct: float = 0.05              # stop placed just above the price where a
+                                                # full stop-out would consume 5% of buying power
+    min_stop_ticks: int = 4                    # if the 5% cap can't leave even this much
+                                                # stop room, skip the trade entirely
 
-    # Cost model
-    commission_per_side: float = 2.25   # round-turn ~$4.50 typical ES retail; per side here
-    slippage_ticks: float = 1.0         # assumed slippage per fill, in ticks
+    # Signal-series tick size (ES and MES both tick in 0.25)
+    tick_size: float = 0.25
+
+    # Cost model — per-instrument fees live in InstrumentSpec.fee_per_side;
+    # slippage is charged per fill in ticks (converted to USD via the
+    # executing instrument's point value).
+    slippage_ticks: float = 1.0
 
 
 @dataclass

@@ -10,16 +10,60 @@ ninjatrader_es_mes/
 ├── NinjaScript/
 │   └── ORBTrendATRStrategy.cs   ← import this into NinjaTrader 8
 ├── backtest/
-│   ├── data.py                  ← fetches & caches ES=F / MES=F bars
-│   ├── strategy.py               ← shared params + EMA/ATR math
+│   ├── data.py                  ← fetches/caches ES=F / MES=F bars + RTH filter
+│   ├── strategy.py               ← shared params, instrument/fee specs, EMA/ATR math
 │   ├── engine.py                  ← bar-by-bar simulator (the fill model)
 │   ├── metrics.py                  ← performance stats
 │   ├── failure_analysis.py          ← systemic vs one-off classifier
 │   ├── run_backtest.py               ← orchestrates everything
-│   ├── data/                          ← cached OHLCV CSVs
+│   ├── data/                          ← cached OHLCV CSVs (git-ignored)
 │   └── output/                         ← results.json, trade logs, equity charts
 └── README.md                            ← this file
 ```
+
+---
+
+## 0. v2 reassessment — what was audited and changed
+
+The v1 code was re-audited top to bottom. Findings and fixes:
+
+**Defects found in v1 (all fixed):**
+
+1. **Extended-hours leak.** Yahoo's futures feed includes the overnight
+   Globex session — **71.8% of the 5-minute bars** fed to the v1 engine
+   were extended-hours bars. Entries were time-gated to RTH, but the
+   EMA(50)/ATR(14) filters were computed over the overnight stream
+   (diverging from a NinjaTrader RTH chart), and on early-close holidays
+   the 1-hour run held positions past the 13:00 close and exited them at
+   the **18:00 ET Globex reopen** — 4 confirmed extended-hours exits
+   (Black Friday 2024/2025, Memorial Day 2025, Juneteenth 2025). v2
+   hard-filters all data to weekday 09:30–16:00 ET before anything touches
+   it, adds a half-day guard that closes any surviving position on the
+   short session's final bar, and the NinjaScript gained an explicit RTH
+   time gate that refuses to act on any bar outside 09:30–16:00 ET even on
+   a 24/7 chart template. Re-verified: **0 of 490 trade legs across all v2
+   runs touch extended hours.**
+
+2. **Fees undercounted by ~half, and wrong per instrument.** v1 charged
+   commission only on exit legs — the entry side of every position was
+   never charged — and used one flat $2.25/side for both symbols. v2
+   charges the full per-instrument fee stack on every fill leg (entry,
+   scale-out, exit); see §2.1.
+
+**New behavior added in v2 (per requirements):**
+
+3. **Dual-feed, MES-first execution.** The strategy now pulls both ES and
+   MES data. Signals are always computed on the ES series (the deep,
+   price-discovering contract; MES tracks it within a tick). Every entry
+   executes on **MES while account buying power ≤ $20,000** and on ES only
+   above that threshold (`BuyingPowerSwitchUsd`).
+
+4. **Catastrophic stop cap at 5% of buying power.** The protective stop
+   order is placed **one tick above the price at which a full stop-out —
+   fees included — would consume 5% of current buying power**
+   (`BpStopCapPct`). The ATR stop stands when it is already tighter; if
+   even the capped stop would leave less than a few ticks of room, the
+   trade is skipped and logged rather than entered with a nonsense stop.
 
 ---
 
@@ -28,250 +72,196 @@ ninjatrader_es_mes/
 **ORB + Trend + ATR** (`ORBTrendATRStrategy.cs`): trade the breakout of the
 first 15 minutes of the RTH session (09:30–09:45 ET), filtered so it only
 takes breakouts that agree with the intraday trend and only on days with
-"tradeable" volatility.
+tradeable volatility.
 
 | Rule | Detail |
 |---|---|
-| Opening range | High/low of the first `OrbMinutes` (default 15) minutes of RTH |
-| Trend filter | EMA(50) on the 5-min chart — longs only above it, shorts only below it |
-| Volatility filter | ATR(14) must sit inside `[MinAtrTicks, MaxAtrTicks]` — skips dead-quiet chop and news-spike regimes alike |
-| Entry | Market order once price closes through `orb_high + buffer` (long) / `orb_low − buffer` (short), one attempt per side per day, cutoff at `MaxEntryTimeHHmm` (default 11:30 ET) |
-| Initial stop | `max(1.5×ATR, 0.5×ORB range width)` behind entry — never tighter than half the opening range |
-| Target / trail | 2R fixed target; at +1R, 50% scales out, stop moves to breakeven, remainder trails by `1.25×ATR` |
-| Session control | No entries after 11:30 ET; everything flattened and orders cancelled at 15:55 ET — no overnight/rollover exposure |
-| Position sizing | `contracts = floor(RiskPerTradeUsd / (stop_distance_pts × PointValue))`, capped at `MaxContracts`. `PointValue` is read from the instrument ($50/pt ES, $5/pt MES) so the same settings auto-scale between the two symbols |
-| Guardrails | Daily loss limit halts new entries (existing brackets still manage); max 2 trades/day; instrument guard refuses to run on anything but ES/MES |
+| Session | **RTH only** (09:30–16:00 ET), enforced by an explicit time gate |
+| Data | Both ES and MES load; signals from ES, execution routed by buying power |
+| Execution routing | **MES while buying power ≤ $20,000**, ES above |
+| Opening range | High/low of the first `OrbMinutes` (default 15) minutes, ES series |
+| Trend filter | EMA(50) on ES 5-min — longs only above it, shorts only below it |
+| Volatility filter | ATR(14) within `[MinAtrTicks, MaxAtrTicks]` |
+| Entry | Market order after a close through `orb_high + buffer` / `orb_low − buffer`; one attempt per side per day; cutoff 11:30 ET |
+| Initial stop | `max(1.5×ATR, 0.5×ORB range)`, then **capped so a full stop-out (incl. fees) costs just under 5% of buying power** |
+| Target / trail | 2R fixed target; at +1R, 50% scales out, stop → breakeven, remainder trails 1.25×ATR |
+| Session control | No entries after 11:30 ET; flatten at 15:55 ET — no overnight exposure |
+| Position sizing | `floor(RiskPerTradeUsd / (stop_pts × PointValue + round_turn_fee))`, capped at `MaxContracts` |
+| Fee guards | Sizing is net of round-turn fees; daily loss limit is fee-inclusive; trades whose 1R gross < 10× round-turn fee are skipped |
+| Guardrails | Daily loss limit; max 2 trades/day; requires both ES and MES series or refuses to run |
 
-**Why this shape:** ORB is a well-worn futures index strategy because ES/MES
-have a real, liquid opening auction and the first 15 minutes reliably sets a
-range that either holds (trend day) or fails (chop/reversal day). The EMA
-filter is there specifically to stop the strategy from taking both the long
-*and* the short breakout on the same trend day (a classic ORB failure mode).
-The ATR floor/ceiling exists because a breakout on an abnormally quiet day is
-noise, and a breakout on an abnormally wild day (economic release, halt,
-flash move) blows through an ATR-sized stop before the fill is even
-confirmed — both get filtered out rather than traded.
+### 1.1 Installing it in NinjaTrader 8
 
-### Installing it in NinjaTrader 8
+1. Copy `ORBTrendATRStrategy.cs` into
+   `Documents\NinjaTrader 8\bin\Custom\Strategies` and compile via the
+   NinjaScript Editor (F5).
+2. Attach to a 5-minute **ES or MES front-month chart** with an RTH session
+   template ("US Index Futures RTH") — the sibling contract (`MES 12-25`
+   for an `ES 12-25` chart, and vice versa) is added automatically.
+3. Backtest in Strategy Analyzer with real tick data before any live/sim
+   use. In the Analyzer the account reports no meaningful buying power, so
+   routing uses `FallbackBuyingPowerUsd` (default $10,000) plus realized
+   strategy P&L — meaning the Analyzer will also exercise the MES→ES
+   switchover if simulated equity crosses $20,000.
 
-1. NinjaTrader 8 → Tools → Import → NinjaScript Add-On, or copy
-   `ORBTrendATRStrategy.cs` into `Documents\NinjaTrader 8\bin\Custom\Strategies`
-   and compile via the NinjaScript Editor (F5).
-2. Attach a 5-minute ES or MES front-month chart, session template "US Index
-   Futures RTH" (or your broker's equivalent).
-3. Strategies → ORBTrendATRStrategy → set contract/margin account,
-   backtest first in Strategy Analyzer with real tick-replay data before
-   any live/sim deployment.
-
-This file was written to NinjaScript/NinjaTrader 8 conventions but has
-**not been compiled inside an actual NinjaTrader install** (none is
-available in this environment) — treat it as a strong first draft and let
-the NinjaScript compiler have the final word on any local API-version
-drift.
+Written to NinjaTrader 8 conventions but **not compiled against actual
+NinjaTrader assemblies here** (none available in this environment) — let
+the NinjaScript compiler have the final word on any API drift.
 
 ---
 
 ## 2. Backtest methodology — and its limits
 
-NinjaTrader's own backtester (Strategy Analyzer / Market Replay) needs a
-tick-level historical feed (Kinetick, CQG, Continuum, Rithmic...) that isn't
-reachable from this sandboxed environment. Instead, `backtest/` is a
-from-scratch Python re-implementation of the exact same rules
-(`strategy.py`/`engine.py` mirror the `.cs` file's logic and fill semantics
-— see the docstring in `engine.py` for the precise fill model: entries fill
-at the *next* bar's open, since the `.cs` file uses `Calculate.OnBarClose`;
-stop/target orders fill intrabar off each bar's high/low, matching how
-`SetStopLoss`/`SetProfitTarget` actually behave in NinjaTrader even in
-`OnBarClose` mode) run against **real ES/MES history pulled from Yahoo
-Finance's continuous front-month futures feed** (`ES=F`, `MES=F`).
+NinjaTrader's own backtester needs a tick-level feed not reachable from
+this environment, so `backtest/` re-implements the exact rules in Python
+(`engine.py` documents the fill model precisely: signal on bar close →
+entry at next bar's open ± 1 tick slippage; stops/targets fill intrabar
+off high/low, stop wins ties) and runs them against real ES=F / MES=F
+history from Yahoo Finance, **hard-filtered to RTH**.
 
-**Known limitations of this substitute, stated plainly:**
+### 2.1 Fee model (per contract, per side, all-in)
 
-- Yahoo's free intraday feed only goes back **60 days at 5-minute
-  granularity**, vs. the years of tick history NinjaTrader's own backtester
-  would use. The 5-minute results below (`ES_5m_60d`, `MES_5m_60d`) are a
-  ~48-trading-day sample — real, but statistically thin. Don't treat the
-  win rate/profit factor from that run as a stable long-run estimate.
-- To get more regime coverage, a second run uses **1-hour bars over the
-  full 730-day Yahoo allowance** (`ES_1h_730d`), with the opening range
-  scaled to 60 minutes. This is a genuinely different (coarser) strategy
-  instance, not the same signals at higher fidelity — its purpose here is
-  stress-testing the *rule structure* across ~2 years of varied regimes,
-  not validating the 5-minute NinjaScript directly.
-- Continuous-front-month series splice in contract rolls; Yahoo's roll
-  adjustment can introduce small artificial gaps around expiration that a
-  true single-contract series wouldn't have.
-- Fills assume $2.25/side commission and 1 tick of slippage per fill — a
-  reasonable retail-futures assumption, not what your specific broker/data
-  feed will actually give you.
-- Same-bar stop-and-target ambiguity (a 5-min bar wide enough to plausibly
-  touch both) is resolved conservatively in favor of the stop. Real
-  intrabar path could occasionally differ.
+| Component | ES | MES |
+|---|---|---|
+| Broker commission (NinjaTrader free plan) | $1.29 | $0.35 |
+| CME exchange & clearing | $1.40 | $0.37 |
+| NFA regulatory | $0.02 | $0.02 |
+| **Total per side** | **$2.71** | **$0.74** |
+| **Round turn** | **$5.42** | **$1.48** |
 
-**Bottom line:** this validates the *rule logic* is sound and the strategy
-behaves as designed, and it surfaces real failure patterns worth fixing —
-but it is not a substitute for running the actual `.cs` file through
-NinjaTrader's Strategy Analyzer against several years of tick data (and
-then forward-testing on sim) before committing real capital.
+These are defaults in `strategy.py` (`ES_SPEC` / `MES_SPEC`) and NinjaScript
+parameters (`EsFeePerSideUsd` / `MesFeePerSideUsd`) — substitute your
+broker's actual schedule. Fees are charged on every fill leg and folded
+into sizing, the 5% stop cap, and the daily loss limit. Slippage: 1 tick
+per fill ($12.50/contract ES, $1.25 MES).
 
-### Reproducing it
+### 2.2 Known limitations
+
+- Yahoo caps 5-minute history at 60 days; the 5-min runs are a
+  ~45-trading-day sample — real data, but statistically thin.
+- The 1-hour/730-day run exists for regime coverage; hourly bars are
+  stamped on the hour, so its opening range is the 10:00 bar and its
+  flatten is the 15:00 bar (which closes at the 16:00 session close). It
+  is a coarser cousin of the 5-minute strategy, not the same instance.
+- Continuous front-month series splice contract rolls.
+- Same-bar stop+target ambiguity resolves to the stop (conservative).
+- MES fills are priced off MES's own bars (timestamp-aligned to the ES
+  signal series, ES fallback on feed gaps).
+
+**Bottom line:** this validates rule logic and surfaces failure patterns;
+it is not a substitute for Strategy Analyzer on tick data plus sim
+forward-testing.
+
+### 2.3 Reproducing
 
 ```bash
 cd ninjatrader_es_mes/backtest
 pip install -r requirements.txt
-python run_backtest.py --refresh   # omit --refresh to reuse cached data/*.csv
+python run_backtest.py --refresh   # omit --refresh to reuse cached CSVs
 ```
-
-Outputs land in `backtest/output/`: `results.json` (full stats + failure
-analysis), one `trades_<label>.csv` per run, and one `equity_<label>.png`
-equity curve per run.
 
 ---
 
-## 3. Backtest results
+## 3. Backtest results (v2)
 
-Starting equity $50,000 (illustrative — position sizing is risk-based, not
-equity-based, so this only sets the drawdown-% denominator).
+Starting equity **$10,000** — deliberately below the $20k switch threshold
+so the MES-first rule is exercised. All entries/exits verified inside
+09:30–16:00 ET.
 
-| Run | Symbol | Bars | Days | Trades | Win rate | Profit factor | Net P&L | Max DD | Max DD % | Longest losing streak |
-|---|---|---|---|---|---|---|---|---|---|---|
-| `ES_5m_60d` | ES | 13,509 (5m) | 48 | 66 | 33.3% | 0.89 | **−$3,326** | $9,290 | 18.6% | 8 |
-| `MES_5m_60d` | MES | 13,512 (5m) | 48 | 69 (+23 scale legs) | 40.6% | 1.07 | **+$963** | $4,322 | 8.6% | 10 |
-| `ES_1h_730d` | ES | 13,699 (1h) | 409 | 409 | 46.9% | 1.01 | **+$2,336** | $34,247 | 54.4% | 9 |
+| Run | Execution | Trades | Win rate | Profit factor | Net P&L | Return | Max DD | Longest losing streak |
+|---|---|---|---|---|---|---|---|---|
+| `DUAL_5m_60d` | **all 63 on MES** (equity never crossed $20k) | 63 (+23 scale legs) | 39.7% | 1.083 | **+$1,050** | +10.5% | $2,898 (29.0%) | 6 |
+| `ES_5m_60d_ref` | pinned to ES (rule ignored) | 63 | 23.8% | 0.491 | **−$7,033** | −70.3% | $7,254 (72.5%) | 11 |
+| `DUAL_1h_730d` | all 325 on MES | 325 (+16 scale legs) | 50.8% | 1.099 | **+$3,510** | +35.1% | $3,166 (28.5%) | 6 |
 
-Full numbers (Sharpe, expectancy, avg R, etc.) are in
-`backtest/output/results.json`; equity curves are the `equity_*.png` files.
+Full stats in `backtest/output/results.json`; equity curves in
+`equity_*.png`; per-trade logs in `trades_*.csv`.
 
-**Reading these honestly:** the 5-minute ES run — the one that actually
-matches the `.cs` file's intended timeframe — is close to breakeven-to-
-slightly-negative over its (short) sample, dragged down mainly by
-commissions/slippage on a ~33% win rate. MES on the identical signals comes
-out slightly positive because its $5/pt economics make the fixed
-per-trade cost drag much lighter relative to the same point-move P&L. The
-1-hour variant posts a positive total but only by round-tripping through a
-54%-of-equity drawdown that never recovered inside the sample window — see
-§4, that's the headline failure, not a footnote.
+**The reference run is the point.** Identical signals, identical days: MES
+execution on a $10k account returns +10.5%, ES execution destroys 70% of
+the account. Two compounding mechanisms cause this, and both are exactly
+what the routing rule and stop cap are designed to prevent: (1) an ES
+point is $50, so the same stop distance risks 10× more per contract, and
+(2) as equity shrinks, the 5% cap forces ever-tighter stops on ES until
+routine noise clips them (win rate collapses from 39.7% → 23.8%). MES's
+smaller unit lets the cap breathe. **The $20k threshold is not cosmetic —
+below it, ES sizing genuinely cannot fit inside a sane risk envelope.**
+
+Note the MES→ES switchover never fired: neither dual run's equity crossed
+$20,000 in-sample ($11.0k / $13.5k peaks). The routing logic is exercised
+every trade (it evaluates and picks MES); the ES branch is exercised by
+the reference run.
 
 ---
 
 ## 4. Failure point analysis: systemic vs. one-off
 
-`failure_analysis.py` tags every losing round-trip by probable cause, then
-checks two things before calling a pattern "systemic": (a) does the same
-tag recur **3+ times within a 5-day window** (a genuine cluster), and (b)
-does the tag recur repeatedly **across unrelated weeks/months** spread
-through the whole sample (a structural weakness, not a bad week). A loss
-that matches neither — no nearby siblings, doesn't reappear elsewhere — is
-called one-off.
+Method unchanged from v1 (`failure_analysis.py`): each losing round-trip is
+tagged by probable cause; a tag is **systemic** when it recurs 3+ times
+within a 5-day window or repeatedly across unrelated weeks, **one-off**
+when isolated. v2 numbers:
 
-### 4.1 Systemic: fake breakouts that reverse (`FADE_INTO_TREND`)
+### 4.1 Systemic: fake breakouts that immediately reverse (`FADE_INTO_TREND`)
 
-**~59% of all losing trades on both `ES_5m_60d` and `MES_5m_60d`.** Price
-closes through the ORB level, the entry fires, and price immediately gives
-it back and runs the other way — a classic ORB fake-out. This tag clusters
-repeatedly across unrelated weeks (late May, early June, mid-to-late June,
-and again through most of July in the 5-min run) — it is not tied to any
-single news event, it is the strategy's structural weak point.
+**60.5% of 5-min losses (23 of 38, −$8,041); 66.7% on the ES reference
+run.** The breakout close fires, the next bars give it back. Clusters
+repeat across unrelated weeks (early June, mid-June, most of July) — the
+strategy's structural weak point, unchanged from v1. Fix candidates:
+require a second confirming close beyond the level, widen the buffer on
+low-ATR days, or a cooldown before re-arming a stopped-out side.
 
-**Why it's systemic, not bad luck:** a 2-tick buffer past a 15-minute range
-is a low bar. On a genuinely choppy day the first push past the range is
-exactly the kind of move that reverses. The EMA(50) trend filter helps
-(it blocks counter-trend breakouts) but does nothing to stop a
-trend-aligned breakout that's simply premature.
+### 4.2 Systemic: marginal-conviction entries stopped in chop (`CHOP_STOPPED`)
 
-**What would fix it:** require a second confirming bar close beyond the
-level (not just a touch), widen the buffer on lower-ATR days specifically,
-or add a short cooldown before re-arming the same side after a same-day
-stop-out so the strategy doesn't immediately re-fight the same failed
-level.
+**23.7% of 5-min losses (9, −$2,351).** Bottom-quartile-ATR entries that
+died same-session, clustering mid-June and mid-July. The static 12-tick
+ATR floor is too low; make it adaptive (percentile of trailing 20-day ATR).
 
-### 4.2 Systemic: entries on marginal-conviction days (`CHOP_STOPPED`)
+### 4.3 Mostly one-off: high-ATR stop-outs (`WIDE_RANGE_STOP`)
 
-**~25–29% of losses.** Entries where ATR at signal time was in the bottom
-quartile of the sample still got stopped out same-session. This also
-clusters (mid-June, mid-to-late July) rather than appearing as isolated
-noise — the `MinAtrTicks` floor (12 ticks / 3.0 pts on ES) is set too low
-to actually screen out the low-conviction days it's meant to filter.
+**15.8% of 5-min losses (6, −$2,226)**, concentrated in the one genuinely
+volatile stretch (June 8–12) plus scattered singles; on the 1-hour run it
+is 2 losses / 1.2%. Verdict unchanged: predominantly event-driven
+one-offs. An explicit macro-calendar blackout (FOMC/CPI/NFP) would address
+these without tightening the ATR ceiling on good trend days.
 
-**What would fix it:** raise the ATR floor, or better, make it adaptive
-(e.g. percentile of the trailing 20-day ATR rather than a fixed tick
-count) so "quiet" is judged relative to the recent regime, not a constant.
+### 4.4 The 1-hour variant: systemic weakness transformed, not cured
 
-### 4.3 Mixed: stopped out on high-ATR entries (`WIDE_RANGE_STOP`)
-
-**~12–14% of losses**, but its individual clusters are smaller and more
-scattered than the two patterns above — several instances land as isolated
-single-day events (`2024-08-06`, `2025-12-18`, `2026-03-10`, `2026-04-01`
-in the 1-hour run) with no repeat nearby, alongside a few genuine multi-day
-clusters (e.g. `2026-06-08` → `2026-06-12` in the 5-min run,
-`2025-03-05` → `2025-03-11` in the 1-hour run — 3 losses in a week,
-consistent with a specific volatile stretch rather than a standing
-weakness). **Verdict: mostly one-off, with one confirmed systemic pocket**
-— the `MaxAtrTicks` ceiling (160 ticks / 40 pts on ES) is wide enough that
-occasional multi-day volatile stretches still get traded; consider pairing
-it with an explicit macro-event blackout (FOMC, CPI, NFP) rather than
-tightening the ceiling further, since tightening would also cut off good
-trend days.
-
-### 4.4 Systemic — and the single biggest problem found: the 1-hour variant's 6-month drawdown
-
-The `ES_1h_730d` run's equity curve peaks on **2025-01-03** and does not
-make a new high again through the end of the sample (2026-08-04) — the
-deepest stretch, **2025-01-03 → 2025-07-04, is a $34,247 (54%-of-starting-
-equity) drawdown that never recovered inside the backtest window.** This
-is not one bad week: it spans roughly six months and dozens of unrelated
-trading days across an entire regime change. By definition that is
-**systemic**, not a one-off — the 60-minute opening-range / ATR-stop
-combination is structurally mismatched to that stretch of the market (most
-likely: hourly ATR stops are wide enough that losers cost multiples of what
-winners on the same timeframe pay back, given the realized win rate of
-~47% and a profit factor barely above 1.01).
-
-**Conclusion: don't run the 60-minute variant as configured.** It was
-included here specifically as a stress test of the rule structure across
-more regimes, and it found a real structural gap — the position-sizing and
-stop-distance model that works on a 5-minute chart does not simply transfer
-to an hourly one without re-tuning the reward:risk ratio and/or the stop
-multiple. The 5-minute configuration (the one the `.cs` file actually ships
-with) is the one to trust.
+v1's headline failure was the 1-hour run's unrecovered 54% drawdown under
+ES economics. v2's 1-hour run (MES execution, fee-aware sizing, 5% cap)
+ends +35.1% — but look closer before celebrating: **75% of its losses
+(120, −$19,343) are tagged `OTHER`**, i.e. positions that neither hit
+their stop nor their target but bled out at the session flatten, and its
+average R-multiple is −0.72. The hourly timeframe still doesn't give the
+2R target room to resolve inside one session — a structural mismatch
+(SYSTEMIC), consistent with v1's conclusion. The micro sizing and stop cap
+now contain the damage per trade, which is why the equity curve survives;
+they don't fix the underlying timeframe problem. **Recommendation stands:
+don't deploy the hourly configuration; the 5-minute one is the strategy.**
 
 ### 4.5 One-off examples (for contrast)
 
-- `2024-08-06`, `WIDE_RANGE_STOP`, −$2,479 — isolated, no clustering
-  before/after it in the 1-hour run.
-- `2025-04-02`, `OTHER`, −$5,177 — a single outsized loss with no repeat
-  nearby; consistent with an isolated news/gap event rather than a
-  structural issue.
-- `2026-05-27`, `FADE_INTO_TREND`, −$551 in the 5-min run — the only
-  isolated instance of this tag; every other occurrence of the same tag in
-  that run is part of a multi-day cluster (see §4.1).
+- `2026-05-27` `FADE_INTO_TREND` — the only isolated instance of its tag in
+  the 5-min run; every other one belongs to a multi-day cluster.
+- `2024-08-06` `WIDE_RANGE_STOP` (1-hour run) — no repeats within weeks on
+  either side; consistent with an isolated volatility event.
 
-These are exactly the kind of losses a systemic fix would *not* prevent —
-they're the cost of doing business with a stop-based strategy, not a rule
-weakness to chase.
+These are the cost of doing business with stops — not rule weaknesses to
+chase with more parameters.
 
 ---
 
 ## 5. Recommendations before any live/sim deployment
 
-1. **Re-validate in NinjaTrader itself** with Strategy Analyzer against
-   several years of real tick data before trusting these numbers further —
-   this Python harness is a rules-fidelity check, not a replacement.
-2. **Fix the two confirmed systemic issues first:** require a confirming
-   second bar (or a small additional buffer) before arming an entry, and
-   make the ATR floor adaptive to the trailing regime instead of a fixed
-   tick count. Both are cheap, mechanical changes to `ORBTrendATRStrategy.cs`.
-3. **Do not run the 60-minute-bar configuration live.** If a higher-
-   timeframe variant is wanted, its stop/target multiples and reward:risk
-   need to be re-optimized independently, not inherited from the 5-minute
-   settings.
-4. **Add an explicit macro-event blackout** (FOMC/CPI/NFP mornings) to stop
-   the ATR ceiling from occasionally admitting genuinely dangerous
-   volatility regimes rather than just tightening it and cutting off good
-   trend days too.
-5. **Forward-test on sim** for at least several weeks after any rule change
-   — the systemic patterns found here recur on a multi-week cadence, so a
-   few sim days won't be enough to confirm a fix.
+1. **Re-validate in NinjaTrader's Strategy Analyzer** on several years of
+   tick data; then forward-test on sim for weeks (the systemic patterns
+   recur on a multi-week cadence — a few days proves nothing).
+2. **Fix the two systemic 5-minute failure modes** (confirming-close
+   requirement; adaptive ATR floor) — both are small mechanical edits.
+3. **Keep the MES-first rule.** The reference run is the evidence: ES on a
+   sub-$20k account is a 70% drawdown machine on the exact same signals.
+4. **Don't deploy the hourly configuration** (see §4.4).
+5. **Add a macro-event blackout** (FOMC/CPI/NFP) for the residual
+   high-ATR one-offs.
 
 This is a research/engineering exercise, not investment advice. Futures
 trading carries substantial risk of loss; past and simulated performance

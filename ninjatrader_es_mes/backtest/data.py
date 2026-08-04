@@ -24,6 +24,11 @@ from typing import List, NamedTuple
 
 import requests
 
+from datetime import time as dtime
+from zoneinfo import ZoneInfo
+
+_ET = ZoneInfo("America/New_York")
+
 CA_BUNDLE = "/root/.ccr/ca-bundle.crt"
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 UA = {"User-Agent": "Mozilla/5.0 (compatible; backtest-fetcher/1.0)"}
@@ -114,6 +119,28 @@ def load_csv(symbol: str, interval: str) -> List[Bar]:
                 )
             )
     return bars
+
+
+def filter_rth(bars: List[Bar]) -> List[Bar]:
+    """
+    Keep only regular-trading-hours bars: weekdays, 09:30 <= t < 16:00 ET.
+
+    Yahoo's futures feed includes the full Globex extended session (~72% of
+    all intraday bars). The strategy is RTH-only, and — critically — its
+    EMA/ATR filters must be computed over RTH bars alone to match a
+    NinjaTrader chart running an RTH session template. Feeding ETH bars to
+    the indicators (as backtest v1 did) both distorts the signals and, on
+    early-close holidays, lets a position survive into the 18:00 ET Globex
+    reopen. Everything downstream of data loading uses this filter.
+    """
+    out = []
+    for b in bars:
+        t = datetime.fromtimestamp(b.ts, tz=_ET)
+        if t.weekday() >= 5:
+            continue
+        if dtime(9, 30) <= t.time() < dtime(16, 0):
+            out.append(b)
+    return out
 
 
 def get_bars(symbol: str, rng: str, interval: str, refresh: bool = False) -> List[Bar]:
