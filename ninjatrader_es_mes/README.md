@@ -98,7 +98,13 @@ The v1 code was re-audited top to bottom. Findings and fixes:
    real fees and 1-tick slippage are charged, because the small-target/
    wide-stop geometry pays the full cost stack ~10 times a day while the
    rare loss erases many wins. Win rate is cosmetic; expectancy is not.
-   The module stays in the repo as documented negative research.
+   A trend-day-gated variant (scalp pullbacks only after, and only in the
+   direction of, a confirmed ORB breakout — modeling a live trader's
+   long-only dip-buying on an up day) roughly halves the damage
+   (−$1.5k to −$2.4k across 12 configs, win rates 51-64%) but never turns
+   positive: at this geometry the breakeven win rate is ~70%, and the
+   mechanical entries can't reach it. The module stays in the repo as
+   documented negative research.
 
 ---
 
