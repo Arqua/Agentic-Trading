@@ -173,6 +173,12 @@ class Backtest:
                                             "side": side, "instr": instr,
                                             "reason": "bp_cap_or_fee_guard"})
                     pending_entry = None
+                    # Matches the NinjaScript: a skipped side is spent for
+                    # the day — it does not re-arm on the next bar.
+                    if side == "LONG":
+                        long_triggered = True
+                    else:
+                        short_triggered = True
                 else:
                     qty, stop_dist = plan
                     target_dist = stop_dist * p.reward_risk_ratio
