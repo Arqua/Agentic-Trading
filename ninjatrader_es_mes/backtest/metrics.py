@@ -9,20 +9,23 @@ from strategy import Trade
 
 
 def summarize(trades: List[Trade], starting_equity: float = 50000.0) -> dict:
-    # Only count "closing" legs for win/loss stats (SCALE_OUT legs are partial
-    # realizations of a trade that isn't finished yet, but they DO count
-    # toward total P&L, so total_pnl sums everything).
-    closers = [t for t in trades if t.exit_reason in ("STOP", "TARGET",
+    # A closing leg's pnl_usd already includes its trade's SCALE_OUT leg
+    # (see engine._close_position), so ALL statistics — total P&L, the
+    # equity curve, win/loss splits — are computed over closers only.
+    # SCALE_OUT rows exist in the trade log for inspection; summing them
+    # here would double-count (a bug that inflated every scaling run's
+    # reported P&L before this was caught).
+    closers = [t for t in trades if t.exit_reason in ("STOP", "TARGET", "TIME",
                                                         "SESSION_FLATTEN", "END_OF_DATA")]
     scale_legs = [t for t in trades if t.exit_reason == "SCALE_OUT"]
 
-    total_pnl = sum(t.pnl_usd for t in trades)
+    total_pnl = sum(t.pnl_usd for t in closers)
     n_round_trips = len(closers)
     wins = [t for t in closers if t.pnl_usd > 0]
     losses = [t for t in closers if t.pnl_usd <= 0]
 
-    gross_win = sum(t.pnl_usd for t in wins) + sum(t.pnl_usd for t in scale_legs if t.pnl_usd > 0)
-    gross_loss = sum(t.pnl_usd for t in losses) + sum(t.pnl_usd for t in scale_legs if t.pnl_usd < 0)
+    gross_win = sum(t.pnl_usd for t in wins)
+    gross_loss = sum(t.pnl_usd for t in losses)
 
     win_rate = len(wins) / n_round_trips if n_round_trips else 0.0
     profit_factor = (gross_win / abs(gross_loss)) if gross_loss != 0 else float("inf")
@@ -30,10 +33,8 @@ def summarize(trades: List[Trade], starting_equity: float = 50000.0) -> dict:
     avg_loss = (sum(t.pnl_usd for t in losses) / len(losses)) if losses else 0.0
     expectancy = (win_rate * avg_win) + ((1 - win_rate) * avg_loss) if n_round_trips else 0.0
 
-    # Equity curve & drawdown: walk every leg (scale-outs and closers) in
-    # time order, since scale-out legs realize P&L before the trade closes.
     closers_sorted = sorted(closers, key=lambda t: t.exit_time)
-    all_sorted = sorted(trades, key=lambda t: t.exit_time)
+    all_sorted = closers_sorted
     equity = starting_equity
     peak = starting_equity
     max_dd = 0.0
@@ -50,7 +51,7 @@ def summarize(trades: List[Trade], starting_equity: float = 50000.0) -> dict:
 
     # Daily returns for a (very) rough Sharpe estimate
     daily_pnl: dict = {}
-    for t in trades:
+    for t in closers:
         daily_pnl.setdefault(t.day, 0.0)
         daily_pnl[t.day] += t.pnl_usd
     daily_returns = list(daily_pnl.values())

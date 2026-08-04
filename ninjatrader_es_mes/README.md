@@ -70,6 +70,36 @@ The v1 code was re-audited top to bottom. Findings and fixes:
    10x-fee viability gate, which silently blocked sub-$400 accounts; the
    gate is now the tunable `min_r_fee_mult`, default 3x.)
 
+**v3 (equity-growth pass) — audit finding and changes:**
+
+5. **Metrics double-count bug (v1-v2), now fixed.** A closing trade's P&L
+   already included its scale-out leg, and `metrics.py` ALSO summed the
+   separate SCALE_OUT rows — inflating every scaling run's reported total
+   (the 60-day DUAL run's "+$1,750" was actually **−$2,451** under the old
+   touch-trigger entry). All statistics now come from closing legs only,
+   verified against the engine's own equity accounting. Every number in
+   this README is post-fix.
+
+6. **Confirming-close entry (now the default).** The dominant systemic
+   loss mode was always FADE_INTO_TREND — wick-touch breakouts that
+   immediately reverse. Requiring the signal bar to CLOSE through the
+   trigger (`confirm_close` / `ConfirmClose`) attacks it directly, and it
+   shows on both samples: the 60-day 5-minute run flips from −$2,451 to
+   **+$892** (win rate 39.7% → 49.1%) and the 2-year hourly run's
+   drawdown falls by a third. Reward:risk default moved 2.0 → 1.5, the
+   only setting positive on BOTH samples (picking the single best cell of
+   the 60-day sweep would be curve-fitting).
+
+7. **High-frequency scalping: investigated, rejected.** A trend-pullback
+   scalper (`scalper.py`) was built and swept across 56 configurations
+   (market and limit entries; targets 6-12 ticks, stops 12-32, time
+   stops). Win rates up to **73%** are mechanically easy — and **every
+   single configuration lost money** (best: −$5.2k over 60 days) once
+   real fees and 1-tick slippage are charged, because the small-target/
+   wide-stop geometry pays the full cost stack ~10 times a day while the
+   rare loss erases many wins. Win rate is cosmetic; expectancy is not.
+   The module stays in the repo as documented negative research.
+
 ---
 
 ## 1. The strategy
@@ -87,9 +117,9 @@ tradeable volatility.
 | Opening range | High/low of the first `OrbMinutes` (default 15) minutes, ES series |
 | Trend filter | EMA(50) on ES 5-min — longs only above it, shorts only below it |
 | Volatility filter | ATR(14) within `[MinAtrTicks, MaxAtrTicks]` |
-| Entry | Market order after a close through `orb_high + buffer` / `orb_low − buffer`; one attempt per side per day; cutoff 11:30 ET |
+| Entry | Bar must **close** through `orb_high + buffer` / `orb_low − buffer` (`ConfirmClose`, default on); one attempt per side per day; cutoff 11:30 ET |
 | Initial stop | `max(1.5×ATR, 0.5×ORB range)`, then **capped so the position sells off at exactly 5% of buying power** (size reduces first when the cap can't fit the quantity) |
-| Target / trail | 2R fixed target; at +1R, 50% scales out, stop → breakeven, remainder trails 1.25×ATR |
+| Target / trail | 1.5R fixed target; at +1R, 50% scales out, stop → breakeven, remainder trails 1.25×ATR |
 | Session control | No entries after 11:30 ET; flatten at 15:55 ET — no overnight exposure |
 | Position sizing | `floor(RiskPerTradeUsd / (stop_pts × PointValue + round_turn_fee))`, capped at `MaxContracts` |
 | Fee guards | Sizing is net of round-turn fees; daily loss limit is fee-inclusive; trades whose 1R gross < 3× round-turn fee (`min_r_fee_mult`) are skipped |
@@ -173,11 +203,14 @@ Starting equity **$10,000** — deliberately below the $20k switch threshold
 so the MES-first rule is exercised. All entries/exits verified inside
 09:30–16:00 ET.
 
+All figures below use the corrected (closers-only) accounting and the v3
+defaults (confirming close, 1.5R):
+
 | Run | Execution | Trades | Win rate | Profit factor | Net P&L | Return | Max DD | Longest losing streak |
 |---|---|---|---|---|---|---|---|---|
-| `DUAL_5m_60d` | **all 63 on MES** (equity never crossed $20k) | 63 (+23 scale legs) | 39.7% | 1.135 | **+$1,750** | +17.5% | $2,850 (28.5%) | 6 |
-| `ES_5m_60d_ref` | pinned to ES (rule ignored) | 63 | 23.8% | 0.489 | **−$7,284** | −72.8% | $7,514 (75.1%) | 11 |
-| `DUAL_1h_730d` | all 325 on MES | 325 (+16 scale legs) | 50.5% | 1.087 | **+$3,118** | +31.2% | $3,633 (35.4%) | 6 |
+| `DUAL_5m_60d` | **all 55 on MES** (equity never crossed $20k) | 55 | 49.1% | 1.089 | **+$892** | +8.9% | 31.2% | 5 |
+| `ES_5m_60d_ref` | pinned to ES (rule ignored) | 55 | 29.1% | 0.477 | **−$6,534** | −65.3% | 70.8% | 11 |
+| `DUAL_1h_730d` | all 231 on MES | 231 | 53.7% | 1.017 | **+$416** | +4.2% | 25.3% | 6 |
 
 Full stats in `backtest/output/results.json`; equity curves in
 `equity_*.png`; per-trade logs in `trades_*.csv`.
@@ -203,13 +236,13 @@ from a $250 balance:
 
 | Balance | Trades | Skipped | Outcome |
 |---|---|---|---|
-| $250 | 17 | 46 | **−$152 (−61%), win rate 11.8%, frozen at $97.69 by 6/12** |
+| $250 | 19 | 41 | **−$157 (−63%), win rate 15.8%, frozen at $93.26** |
 
 With the sell-off cap at exactly 5% of buying power, a $250 account can
 trade — 1 MES contract with a 2.5-point stop — but that stop is a quarter
 of the ~10-point ATR stop the entries were designed around, so routine
-noise clips it (2 wins in 17 trades). Each loss shrinks buying power and
-therefore the next stop, until equity reaches ~$100, where 5% can no
+noise clips it (3 wins in 19 trades). Each loss shrinks buying power and
+therefore the next stop, until equity reaches ~$93, where 5% can no
 longer buy even a 1-point stop and the guards freeze the account (all 46
 remaining signals skipped). This is the same death-by-tight-stops
 mechanism as the ES reference run, in miniature — the cap contains each
@@ -228,22 +261,23 @@ when isolated. v2 numbers:
 
 ### 4.1 Systemic: fake breakouts that immediately reverse (`FADE_INTO_TREND`)
 
-**60.5% of 5-min losses (23 of 38, −$8,041); 66.7% on the ES reference
-run.** The breakout close fires, the next bars give it back. Clusters
-repeat across unrelated weeks (early June, mid-June, most of July) — the
-strategy's structural weak point, unchanged from v1. Fix candidates:
-require a second confirming close beyond the level, widen the buffer on
+**60.7% of 5-min losses (17 of 28, −$6,416); 64.1% on the ES reference
+run — even after the confirming-close entry (v3) removed the worst
+wick-touch cases.** The breakout close fires, the next bars give it back. Clusters
+repeat across unrelated weeks — still the structural weak point, though
+the confirming-close entry (v3, adopted) already cut both its frequency
+and the overall drawdown. Remaining fix candidates: widen the buffer on
 low-ATR days, or a cooldown before re-arming a stopped-out side.
 
 ### 4.2 Systemic: marginal-conviction entries stopped in chop (`CHOP_STOPPED`)
 
-**23.7% of 5-min losses (9, −$2,351).** Bottom-quartile-ATR entries that
+**25.0% of 5-min losses (7, −$1,962).** Bottom-quartile-ATR entries that
 died same-session, clustering mid-June and mid-July. The static 12-tick
 ATR floor is too low; make it adaptive (percentile of trailing 20-day ATR).
 
 ### 4.3 Mostly one-off: high-ATR stop-outs (`WIDE_RANGE_STOP`)
 
-**15.8% of 5-min losses (6, −$2,226)**, concentrated in the one genuinely
+**14.3% of 5-min losses (4, −$1,665)**, concentrated in the one genuinely
 volatile stretch (June 8–12) plus scattered singles; on the 1-hour run it
 is 2 losses / 1.2%. Verdict unchanged: predominantly event-driven
 one-offs. An explicit macro-calendar blackout (FOMC/CPI/NFP) would address

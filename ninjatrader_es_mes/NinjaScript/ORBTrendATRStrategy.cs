@@ -82,6 +82,10 @@ namespace NinjaTrader.NinjaScript.Strategies
         public int BufferTicks { get; set; }
 
         [NinjaScriptProperty]
+        [Display(Name = "Require close through trigger", GroupName = "1. Opening Range", Order = 3)]
+        public bool ConfirmClose { get; set; }
+
+        [NinjaScriptProperty]
         [Range(2, 200)]
         [Display(Name = "Trend EMA period", GroupName = "2. Filters", Order = 1)]
         public int TrendPeriod { get; set; }
@@ -228,13 +232,14 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                 OrbMinutes = 15;
                 BufferTicks = 2;
+                ConfirmClose = true;
                 TrendPeriod = 50;
                 AtrPeriod = 14;
                 MinAtrTicks = 12;
                 MaxAtrTicks = 160;
                 AtrStopMult = 1.5;
                 AtrTrailMult = 1.25;
-                RewardRiskRatio = 2.0;
+                RewardRiskRatio = 1.5;
                 ScaleOutPct = 50;
                 BpStopCapPct = 5.0;
                 MinRewardToFeeMult = 3.0;
@@ -398,15 +403,21 @@ namespace NinjaTrader.NinjaScript.Strategies
             double emaVal = trendEma[0];
             double buffer = BufferTicks * TickSize;
 
-            // ── Long breakout: trend-aligned only ───────────────────────
-            if (!longTriggeredToday && price > emaVal && Highs[esIdx][0] >= orbHigh + buffer)
+            // ── Long breakout: trend-aligned only. ConfirmClose demands the
+            //    bar CLOSE through the trigger, not merely touch it — wick
+            //    touches are the strategy's dominant loss source (fake
+            //    breakouts that immediately reverse) ────────────────────────
+            double longRef = ConfirmClose ? Closes[esIdx][0] : Highs[esIdx][0];
+            double shortRef = ConfirmClose ? Closes[esIdx][0] : Lows[esIdx][0];
+
+            if (!longTriggeredToday && price > emaVal && longRef >= orbHigh + buffer)
             {
                 TrySubmitEntry(true, atrVal);
                 return;
             }
 
             // ── Short breakdown: trend-aligned only ─────────────────────
-            if (!shortTriggeredToday && price < emaVal && Lows[esIdx][0] <= orbLow - buffer)
+            if (!shortTriggeredToday && price < emaVal && shortRef <= orbLow - buffer)
             {
                 TrySubmitEntry(false, atrVal);
             }

@@ -60,13 +60,18 @@ MES_SPEC = InstrumentSpec("MES", 5.0, 0.74)
 class Params:
     orb_minutes: int = 15
     buffer_ticks: int = 2
+    confirm_close: bool = True    # require the bar to CLOSE through the trigger
+                                   # (not just touch it). Cuts the FADE_INTO_TREND
+                                   # failure mode; flipped the 60d 5m sample from
+                                   # negative to positive and reduced drawdown on
+                                   # the 730d 1h sample
     trend_period: int = 50
     atr_period: int = 14
     min_atr_ticks: int = 12
     max_atr_ticks: int = 160
     atr_stop_mult: float = 1.5
     atr_trail_mult: float = 1.25
-    reward_risk_ratio: float = 2.0
+    reward_risk_ratio: float = 1.5
     scale_out_pct: float = 50.0
     risk_per_trade_usd: float = 500.0
     max_contracts: int = 5

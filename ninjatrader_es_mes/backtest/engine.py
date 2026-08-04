@@ -280,15 +280,18 @@ class Backtest:
             min_stop_floor = max((orb_high - orb_low) * 0.5, 2 * p.tick_size)
             instr = self._route(equity)
 
+            long_ref = self.closes[i] if p.confirm_close else self.highs[i]
+            short_ref = self.closes[i] if p.confirm_close else self.lows[i]
+
             if long_armed and not long_triggered and price > ema_val:
-                if self.highs[i] >= orb_high + buffer:
+                if long_ref >= orb_high + buffer:
                     pending_entry = {"side": "LONG", "instr": instr,
                                       "atr_at_signal": atr_val,
                                       "min_stop_floor": min_stop_floor}
                     continue
 
             if short_armed and not short_triggered and price < ema_val:
-                if self.lows[i] <= orb_low - buffer:
+                if short_ref <= orb_low - buffer:
                     pending_entry = {"side": "SHORT", "instr": instr,
                                       "atr_at_signal": atr_val,
                                       "min_stop_floor": min_stop_floor}
