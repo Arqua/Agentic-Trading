@@ -15,9 +15,12 @@ def summarize(trades: List[Trade], starting_equity: float = 50000.0) -> dict:
     # SCALE_OUT rows exist in the trade log for inspection; summing them
     # here would double-count (a bug that inflated every scaling run's
     # reported P&L before this was caught).
-    closers = [t for t in trades if t.exit_reason in ("STOP", "TARGET", "TIME",
-                                                        "SESSION_FLATTEN", "END_OF_DATA")]
+    # Everything that is not a partial scale-out closes a position. Listing
+    # closing reasons explicitly (as this did originally) silently dropped
+    # any exit reason a newer strategy introduced — the momentum system's
+    # "SIGNAL" reversals vanished from the stats that way.
     scale_legs = [t for t in trades if t.exit_reason == "SCALE_OUT"]
+    closers = [t for t in trades if t.exit_reason != "SCALE_OUT"]
 
     total_pnl = sum(t.pnl_usd for t in closers)
     n_round_trips = len(closers)

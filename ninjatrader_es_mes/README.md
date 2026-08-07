@@ -15,7 +15,10 @@ ninjatrader_es_mes/
 │   ├── engine.py                  ← bar-by-bar simulator (the fill model)
 │   ├── metrics.py                  ← performance stats
 │   ├── failure_analysis.py          ← systemic vs one-off classifier
-│   ├── run_backtest.py               ← orchestrates everything
+│   ├── scalper.py                    ← high-frequency scalper (rejected, §0)
+│   ├── ma_momentum.py                 ← MA momentum/direction system (rejected, §5)
+│   ├── run_backtest.py                 ← orchestrates the ORB backtests
+│   ├── run_momentum.py                  ← orchestrates the MA-momentum report
 │   ├── data/                          ← cached OHLCV CSVs (git-ignored)
 │   └── output/                         ← results.json, trade logs, equity charts
 └── README.md                            ← this file
@@ -315,7 +318,87 @@ chase with more parameters.
 
 ---
 
-## 5. Recommendations before any live/sim deployment
+---
+
+## 5. Alternative tested: MA momentum / direction, every 5 minutes
+
+`ma_momentum.py` + `run_momentum.py` implement and evaluate a different
+premise from the ORB strategy: instead of one setup per day, **re-evaluate
+on every 5-minute bar** and hold the position implied by the moving
+average's direction and the market's momentum.
+
+    slope = MA(t) - MA(t - slope_lookback)      → direction
+    roc   = close(t) - close(t - roc_lookback)  → momentum
+    want  = +1 if slope > +thresh and roc > 0
+            -1 if slope < -thresh and roc < 0
+             0 otherwise (flat / chop zone)
+
+Two readings of "trade every 5 minutes" are both tested: `churn` closes and
+re-opens every single bar; `flip` holds while the signal is unchanged and
+trades only on a change. Same conservative fill model as the ORB engine
+(signal on close → fill at next bar's open ± 1 tick, full fee stack per
+leg, RTH only, flat by 15:55).
+
+### 5.1 Results — 5-minute MES, 44 sessions, 1 contract, $10k
+
+| Config | Trades | /day | Win rate | PF | **Net** | Gross (no costs) | Costs | Max DD |
+|---|---|---|---|---|---|---|---|---|
+| `churn_every_bar` | 2,270 | 46.3 | 42.4% | 0.69 | **−$8,643** | +$391 | $9,035 | 93.6% |
+| `flip_ema20` | 593 | 12.1 | 36.6% | 0.84 | **−$1,969** | +$391 | $2,360 | 40.5% |
+| `flip_ema9_fast` | 658 | 13.4 | 27.8% | 0.87 | **−$1,863** | +$756 | $2,619 | 41.4% |
+| `flip_sma50_slow` | 152 | 4.2 | 44.1% | 1.12 | **+$348** | +$953 | $605 | 8.4% |
+
+### 5.2 Why it fails — the cost decomposition is the whole story
+
+The gross (zero-fee, zero-slippage) edge of this signal is **roughly
+constant at $390–950 regardless of how often it trades** — trading more
+frequently just slices the same underlying move into more pieces. Costs,
+however, scale linearly at a measured **$3.98 per round trip** ($1.48 fees
++ 2 ticks of slippage). That single asymmetry decides everything:
+
+- at 4.2 trades/day → $605 of costs against $953 gross → **+$348**
+- at 12.1 trades/day → $2,360 of costs against $391 gross → **−$1,969**
+- at 46.3 trades/day → $9,035 of costs against $391 gross → **−$8,643**
+
+The literal every-bar version's equity curve
+(`equity_MOMO_churn_every_bar.png`) is a near-straight line from $10,000 to
+~$1,300 — a textbook cost bleed, not a market-direction failure. **The
+frequency itself is the losing decision.**
+
+### 5.3 The one profitable config does not survive validation
+
+`flip_sma50_slow` (+$348) is the only meaningfully positive cell out of
+**144 swept configurations** — about what pure chance produces at that
+sample size. Three checks confirm it is noise:
+
+1. **Its neighbors are losers.** Changing the slope lookback 1→2 gives
+   −$1,306; 1→3 gives −$1,620; MA 50→40 gives −$1,488; SMA→EMA gives
+   −$1,234. A real edge does not sit on an isolated island.
+2. **Walk-forward is a coin flip.** Optimizing on the first half and
+   testing on the second: the best in-sample config returns **+$77** out
+   of sample, and configs ranked 3–5 were *negative* in-sample yet
+   positive out-of-sample — the ordering carries no information. Mean
+   out-of-sample P&L of the top five: **+$92** over five weeks, roughly
+   $1.16/trade against a $3.98/trade cost.
+3. **It inverts on the long sample.** Run on ~2 years of hourly bars, the
+   same rules lose **−$4,301** (PF 0.82, 64% drawdown). Every one of the
+   four configs is negative there, the fast one by −$11,424.
+
+### 5.4 Verdict
+
+**Rejected.** Not deployed, no NinjaScript port. The MA-momentum signal has
+a small real gross edge, but it is an order of magnitude too small to pay
+for the frequency it implies — which is the same arithmetic that killed the
+`scalper.py` experiment (§0, item 7), arrived at from a completely different
+direction. Reproduce with `python run_momentum.py`; the module stays in the
+repo as documented negative research.
+
+For contrast, on the identical 44 sessions and account, the ORB strategy
+turned **55 trades into +$892** — 3% of the churn variant's trade count and
+a $9,500 swing in outcome. When trade frequency is a free parameter, the
+evidence here says push it down, not up.
+
+## 6. Recommendations before any live/sim deployment
 
 1. **Re-validate in NinjaTrader's Strategy Analyzer** on several years of
    tick data; then forward-test on sim for weeks (the systemic patterns

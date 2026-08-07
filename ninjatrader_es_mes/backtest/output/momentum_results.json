@@ -1,0 +1,247 @@
+{
+  "n_bars_5m": 3818,
+  "n_bars_1h": 3602,
+  "configs": {
+    "churn_every_bar": {
+      "net": {
+        "n_trades": 2270,
+        "n_scale_legs": 0,
+        "total_pnl_usd": -8643.35,
+        "win_rate": 0.4238,
+        "profit_factor": 0.692,
+        "avg_win_usd": 20.19,
+        "avg_loss_usd": -21.46,
+        "expectancy_usd": -3.81,
+        "max_drawdown_usd": 9411.48,
+        "max_drawdown_pct": 93.59,
+        "trading_days": 49,
+        "daily_sharpe_annualized": -10.853,
+        "longest_losing_streak": 13,
+        "avg_r_multiple": 0.0,
+        "ending_equity": 1356.65,
+        "starting_equity": 10000.0,
+        "total_return_pct": -86.43
+      },
+      "gross_pnl_usd": 391.25,
+      "total_costs_usd": 9034.6,
+      "cost_per_trade_usd": 3.98
+    },
+    "flip_ema20": {
+      "net": {
+        "n_trades": 593,
+        "n_scale_legs": 0,
+        "total_pnl_usd": -1968.89,
+        "win_rate": 0.3659,
+        "profit_factor": 0.838,
+        "avg_win_usd": 47.06,
+        "avg_loss_usd": -32.39,
+        "expectancy_usd": -3.32,
+        "max_drawdown_usd": 4331.97,
+        "max_drawdown_pct": 40.48,
+        "trading_days": 49,
+        "daily_sharpe_annualized": -2.376,
+        "longest_losing_streak": 9,
+        "avg_r_multiple": 0.0,
+        "ending_equity": 8031.11,
+        "starting_equity": 10000.0,
+        "total_return_pct": -19.69
+      },
+      "gross_pnl_usd": 391.25,
+      "total_costs_usd": 2360.14,
+      "cost_per_trade_usd": 3.98
+    },
+    "flip_ema9_fast": {
+      "net": {
+        "n_trades": 658,
+        "n_scale_legs": 0,
+        "total_pnl_usd": -1862.59,
+        "win_rate": 0.2781,
+        "profit_factor": 0.872,
+        "avg_win_usd": 69.2,
+        "avg_loss_usd": -30.58,
+        "expectancy_usd": -2.83,
+        "max_drawdown_usd": 4468.77,
+        "max_drawdown_pct": 41.4,
+        "trading_days": 49,
+        "daily_sharpe_annualized": -1.959,
+        "longest_losing_streak": 13,
+        "avg_r_multiple": 0.0,
+        "ending_equity": 8137.41,
+        "starting_equity": 10000.0,
+        "total_return_pct": -18.63
+      },
+      "gross_pnl_usd": 756.25,
+      "total_costs_usd": 2618.84,
+      "cost_per_trade_usd": 3.98
+    },
+    "flip_sma50_slow": {
+      "net": {
+        "n_trades": 152,
+        "n_scale_legs": 0,
+        "total_pnl_usd": 347.54,
+        "win_rate": 0.4408,
+        "profit_factor": 1.116,
+        "avg_win_usd": 49.77,
+        "avg_loss_usd": -35.14,
+        "expectancy_usd": 2.29,
+        "max_drawdown_usd": 895.63,
+        "max_drawdown_pct": 8.44,
+        "trading_days": 36,
+        "daily_sharpe_annualized": 1.234,
+        "longest_losing_streak": 7,
+        "avg_r_multiple": 0.0,
+        "ending_equity": 10347.54,
+        "starting_equity": 10000.0,
+        "total_return_pct": 3.48
+      },
+      "gross_pnl_usd": 952.5,
+      "total_costs_usd": 604.96,
+      "cost_per_trade_usd": 3.98
+    }
+  },
+  "walk_forward": {
+    "results": [
+      {
+        "rank": 1,
+        "is_pnl": 274.92,
+        "oos_pnl": 76.83,
+        "config": {
+          "ma_period": 50,
+          "ma_type": "sma",
+          "slope_lookback": 1,
+          "slope_thresh_ticks": 4.0,
+          "require_agree": true
+        }
+      },
+      {
+        "rank": 2,
+        "is_pnl": 185.28,
+        "oos_pnl": -111.76,
+        "config": {
+          "ma_period": 50,
+          "ma_type": "sma",
+          "slope_lookback": 6,
+          "slope_thresh_ticks": 4.0,
+          "require_agree": false
+        }
+      },
+      {
+        "rank": 3,
+        "is_pnl": -45.81,
+        "oos_pnl": 154.78,
+        "config": {
+          "ma_period": 50,
+          "ma_type": "sma",
+          "slope_lookback": 1,
+          "slope_thresh_ticks": 4.0,
+          "require_agree": false
+        }
+      },
+      {
+        "rank": 4,
+        "is_pnl": -62.05,
+        "oos_pnl": 227.98,
+        "config": {
+          "ma_period": 50,
+          "ma_type": "sma",
+          "slope_lookback": 3,
+          "slope_thresh_ticks": 2.0,
+          "require_agree": false
+        }
+      },
+      {
+        "rank": 5,
+        "is_pnl": -399.22,
+        "oos_pnl": 111.93,
+        "config": {
+          "ma_period": 50,
+          "ma_type": "sma",
+          "slope_lookback": 3,
+          "slope_thresh_ticks": 1.0,
+          "require_agree": false
+        }
+      }
+    ],
+    "mean_oos_pnl": 91.95,
+    "n_profitable_in_sample": 2,
+    "n_configs": 144
+  },
+  "regime_check_1h": {
+    "churn_every_bar": {
+      "n_trades": 1963,
+      "n_scale_legs": 0,
+      "total_pnl_usd": -7867.74,
+      "win_rate": 0.4753,
+      "profit_factor": 0.858,
+      "avg_win_usd": 51.07,
+      "avg_loss_usd": -53.9,
+      "expectancy_usd": -4.01,
+      "max_drawdown_usd": 9053.29,
+      "max_drawdown_pct": 90.53,
+      "trading_days": 588,
+      "daily_sharpe_annualized": -1.628,
+      "longest_losing_streak": 9,
+      "avg_r_multiple": 0.0,
+      "ending_equity": 2132.26,
+      "starting_equity": 10000.0,
+      "total_return_pct": -78.68
+    },
+    "flip_ema20": {
+      "n_trades": 735,
+      "n_scale_legs": 0,
+      "total_pnl_usd": -2980.3,
+      "win_rate": 0.4218,
+      "profit_factor": 0.911,
+      "avg_win_usd": 98.78,
+      "avg_loss_usd": -79.07,
+      "expectancy_usd": -4.05,
+      "max_drawdown_usd": 5000.2,
+      "max_drawdown_pct": 50.0,
+      "trading_days": 588,
+      "daily_sharpe_annualized": -0.605,
+      "longest_losing_streak": 10,
+      "avg_r_multiple": 0.0,
+      "ending_equity": 7019.7,
+      "starting_equity": 10000.0,
+      "total_return_pct": -29.8
+    },
+    "flip_ema9_fast": {
+      "n_trades": 907,
+      "n_scale_legs": 0,
+      "total_pnl_usd": -11423.61,
+      "win_rate": 0.4267,
+      "profit_factor": 0.787,
+      "avg_win_usd": 109.32,
+      "avg_loss_usd": -103.33,
+      "expectancy_usd": -12.59,
+      "max_drawdown_usd": 13258.91,
+      "max_drawdown_pct": 132.59,
+      "trading_days": 602,
+      "daily_sharpe_annualized": -1.509,
+      "longest_losing_streak": 9,
+      "avg_r_multiple": 0.0,
+      "ending_equity": -1423.61,
+      "starting_equity": 10000.0,
+      "total_return_pct": -114.24
+    },
+    "flip_sma50_slow": {
+      "n_trades": 520,
+      "n_scale_legs": 0,
+      "total_pnl_usd": -4300.85,
+      "win_rate": 0.4365,
+      "profit_factor": 0.822,
+      "avg_win_usd": 87.29,
+      "avg_loss_usd": -82.31,
+      "expectancy_usd": -8.27,
+      "max_drawdown_usd": 6711.24,
+      "max_drawdown_pct": 64.15,
+      "trading_days": 447,
+      "daily_sharpe_annualized": -1.157,
+      "longest_losing_streak": 13,
+      "avg_r_multiple": 0.0,
+      "ending_equity": 5699.15,
+      "starting_equity": 10000.0,
+      "total_return_pct": -43.01
+    }
+  }
+}
